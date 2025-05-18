@@ -1,0 +1,6 @@
+numpy==2.2.1
+pandas==2.2.3
+scikit_learn==1.6.1
+torch==2.5.1+cu124
+torchvision==0.20.1+cu124
+wandb==0.19.3
