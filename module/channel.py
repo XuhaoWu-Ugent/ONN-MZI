@@ -61,48 +61,107 @@ class SingleChannelFilter(nn.Module):
         
         return total_stats
 
-    def forward(self, x):
+    def forward(self, x, return_intermediate=False):
         """
         Forward propagation function
-        
+
         Args:
             x (Tensor): Input tensor of shape (batch_size, height, width)
-            
+            return_intermediate (bool): Whether to return intermediate values for the first patch
+
         Returns:
-            Tensor: Output tensor of shape (batch_size, output_height, output_width)
+            Tensor or tuple: Output tensor, or tuple of (output, input_patch, processed_patch) if return_intermediate=True
         """
         # Get input dimensions
         batch_size, height, width = x.shape
-        
+
         # Calculate output dimensions
         output_height = height - self.kernel_size + 1
         output_width = width - self.kernel_size + 1
-        
+
         # Extract image patches
         # Add channel dimension and unfold into patches
-        patches = F.unfold(x.unsqueeze(1), 
-                          kernel_size=self.kernel_size, 
-                          stride=1)  # Shape: (batch_size, kernel_size*kernel_size, num_patches)
-        
+        patches = F.unfold(x.unsqueeze(1),
+                           kernel_size=self.kernel_size,
+                           stride=1)  # Shape: (batch_size, kernel_size*kernel_size, num_patches)
+
         # Adjust dimension order
         patches = patches.permute(0, 2, 1)  # Shape: (batch_size, num_patches, kernel_size*kernel_size)
-        
+
         # Pad to 10 dimensions to match MZI layers
         patches = F.pad(patches, (0, 1))  # Shape: (batch_size, num_patches, 10)
-        
+
+        # 保存第一个patch的输入值（如果需要）
+        if return_intermediate:
+            input_patch = patches[:, 0, :].clone().detach()
+
         # Convert to complex type for complex operations
         patches = patches.to(torch.complex64)
-        
+
         # Pass through sequence of MZI layers
         for layer in self.layers:
             if self.flag == 1:
                 layer.flag = 1
             patches = layer(patches)
-        
+
+        # 保存MZI阵列处理后的第一个patch（如果需要）
+        if return_intermediate:
+            processed_patch = patches[:, 0, :].clone().detach()
+
         # Apply diagonal weight matrix and sum
         weighted_output = patches * self.diagonal_matrix.view(1, 1, -1)
-        
+
         # Reshape output to desired spatial dimensions
         output = weighted_output.sum(dim=2).view(batch_size, output_height, output_width)
-        
-        return output
+
+        # 根据参数决定返回值
+        if return_intermediate:
+            return output, input_patch, processed_patch
+        else:
+            return output
+
+    # def forward(self, x):
+    #     """
+    #     Forward propagation function
+    #
+    #     Args:
+    #         x (Tensor): Input tensor of shape (batch_size, height, width)
+    #
+    #     Returns:
+    #         Tensor: Output tensor of shape (batch_size, output_height, output_width)
+    #     """
+    #     # Get input dimensions
+    #     batch_size, height, width = x.shape
+    #
+    #     # Calculate output dimensions
+    #     output_height = height - self.kernel_size + 1
+    #     output_width = width - self.kernel_size + 1
+    #
+    #     # Extract image patches
+    #     # Add channel dimension and unfold into patches
+    #     patches = F.unfold(x.unsqueeze(1),
+    #                       kernel_size=self.kernel_size,
+    #                       stride=1)  # Shape: (batch_size, kernel_size*kernel_size, num_patches)
+    #
+    #     # Adjust dimension order
+    #     patches = patches.permute(0, 2, 1)  # Shape: (batch_size, num_patches, kernel_size*kernel_size)
+    #
+    #     # Pad to 10 dimensions to match MZI layers
+    #     patches = F.pad(patches, (0, 1))  # Shape: (batch_size, num_patches, 10)
+    #
+    #     # Convert to complex type for complex operations
+    #     patches = patches.to(torch.complex64)
+    #
+    #     # Pass through sequence of MZI layers
+    #     for layer in self.layers:
+    #         if self.flag == 1:
+    #             layer.flag = 1
+    #         patches = layer(patches)
+    #
+    #     # Apply diagonal weight matrix and sum
+    #     weighted_output = patches * self.diagonal_matrix.view(1, 1, -1)
+    #
+    #     # Reshape output to desired spatial dimensions
+    #     output = weighted_output.sum(dim=2).view(batch_size, output_height, output_width)
+    #
+    #     return output

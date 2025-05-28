@@ -32,7 +32,7 @@ def get_args():
                         help='Training batch size (default: 200)')
     parser.add_argument('--test-batch-size', type=int, default=200,
                         help='Testing batch size (default: 200)')
-    parser.add_argument('--epochs', type=int, default=10,
+    parser.add_argument('--epochs', type=int, default=1,
                         help='Number of training epochs (default: 10)')
     parser.add_argument('--lr', type=float, default=0.01,
                         help='Learning rate (default: 0.01)')

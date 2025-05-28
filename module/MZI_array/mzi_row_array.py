@@ -5,6 +5,7 @@ import torch.nn.functional as F
 import numpy as np
 from module.MZI_array.mzi import MZI
 
+
 class MZIlayer_row(nn.Module):
     def __init__(self, num):
         """Initialize a row of MZI (Mach-Zehnder Interferometer) modules"""
