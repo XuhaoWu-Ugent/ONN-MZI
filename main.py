@@ -202,7 +202,7 @@ def main():
     transform = transforms.Compose([
         transforms.Resize((args.input_size, args.input_size)),
         transforms.ToTensor(),
-        transforms.Normalize((0.1307,), (0.3081,))
+        # transforms.Normalize((0.1307,), (0.3081,))  # mapping [0, 1] to Normal distribution
     ])
     
     # Load MNIST dataset
