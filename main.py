@@ -22,6 +22,7 @@ def collect_and_save_filter_data(model, dataloader, device, save_dir="filter_dat
     - 单个滤波器的MZI阵列输入 (第一个patch, 1x10) 及其端口映射描述
     - 单个滤波器的MZI阵列输出 (第一个patch, 1x10) 及其端口映射描述
     - 单个滤波器内所有MZI的raw_sin_theta值及其详细位置信息
+    - 单个滤波器内所有MZI的raw_sin_theta值的梯度
     """
     os.makedirs(save_dir, exist_ok=True)
     model.eval()
@@ -46,30 +47,22 @@ def collect_and_save_filter_data(model, dataloader, device, save_dir="filter_dat
             current_filter_data['mzi_array_output'] = mzi_array_processed_patch.detach().cpu().numpy()
 
             # 为MZI阵列的10个输入/输出波导生成描述
-            # module 是 SingleChannelFilter 实例, 它有 kernel_size 属性
             ks = module.kernel_size
-            # F.unfold 将 kernel_size * kernel_size 的patch展平为向量
-            # SingleChannelFilter.forward 中 F.pad(patches, (0, 1)) 将9维向量填充到10维 (假设ks=3)
-            # 如果 ks*ks 不为9, SingleChannelFilter的pad逻辑可能需要调整以确保总是10维
-            # 这里我们假设输入到MZI阵列核心部分总是10路波导
             mzi_array_io_waveguide_desc = []
             num_elements_from_patch = ks * ks
             for i in range(10):  # 假设MZI阵列核心部分总是10路波导
                 if i < num_elements_from_patch:
-                    # F.unfold 按行优先顺序展平patch
                     patch_row = i // ks
                     patch_col = i % ks
                     mzi_array_io_waveguide_desc.append(
                         f"Waveguide {i}: From Patch Element [{patch_row},{patch_col}] (after F.unfold)"
                     )
                 else:
-                    # 超出patch维度的部分是填充的
                     mzi_array_io_waveguide_desc.append(f"Waveguide {i}: Padding")
             current_filter_data['mzi_array_io_waveguide_description'] = mzi_array_io_waveguide_desc
 
-            # 收集此滤波器中所有MZI的raw_sin_theta及其详细位置
+            # 收集此滤波器中所有MZI的raw_sin_theta及其详细位置和梯度
             raw_thetas_with_position = []
-            # module.layers 是 SingleChannelFilter 内部的 MZIlayer_row/column 列表
             for scf_layer_idx, mzi_array_layer_instance in enumerate(module.layers):
                 mzi_array_type = 'unknown_mzi_array_layer'
                 num_mzis_in_this_mzi_array_layer = 0
@@ -84,34 +77,32 @@ def collect_and_save_filter_data(model, dataloader, device, save_dir="filter_dat
 
                     for mzi_idx_in_array, mzi_instance in enumerate(mzi_array_layer_instance.MZI):
                         theta_value = mzi_instance.raw_sin_theta.detach().cpu().numpy().item()
+                        theta_grad = mzi_instance.raw_sin_theta.grad.detach().cpu().numpy().item() if mzi_instance.raw_sin_theta.grad is not None else None
 
                         acting_on_waveguides_desc = "N/A"
                         if mzi_array_type == 'MZIlayer_row':
-                            # MZI[i] (mzi_idx_in_array) 在 MZIlayer_row 中作用于输入总线的波导 2*i 和 2*i+1
                             wg1 = 2 * mzi_idx_in_array
                             wg2 = 2 * mzi_idx_in_array + 1
                             acting_on_waveguides_desc = f"Acts on input waveguides [{wg1}, {wg2}] of the 10-WG bus entering this MZIlayer_row."
                         elif mzi_array_type == 'MZIlayer_column':
-                            # MZI[i] (mzi_idx_in_array) 在 MZIlayer_column 中作用于输入总线的波导 2*i+1 和 2*i+2
-                            # 这是因为MZIlayer_column的波导0是直通的，MZI作用于后续的成对波导。
                             wg1 = (2 * mzi_idx_in_array) + 1
                             wg2 = (2 * mzi_idx_in_array) + 2
                             acting_on_waveguides_desc = f"Acts on input waveguides [{wg1}, {wg2}] of the 10-WG bus entering this MZIlayer_column."
 
                         position_info = {
-                            'scf_mzi_array_layer_index': scf_layer_idx,  # 在SingleChannelFilter.layers中的索引
-                            'mzi_array_layer_type': mzi_array_type,  # 'MZIlayer_row' 或 'MZIlayer_column'
-                            'mzi_index_within_mzi_array_layer': mzi_idx_in_array,  # 在MZIlayer_xxx.MZI列表中的索引
+                            'scf_mzi_array_layer_index': scf_layer_idx,
+                            'mzi_array_layer_type': mzi_array_type,
+                            'mzi_index_within_mzi_array_layer': mzi_idx_in_array,
                             'total_mzis_in_this_mzi_array_layer': num_mzis_in_this_mzi_array_layer,
                             'mzi_acting_on_waveguides_description': acting_on_waveguides_desc
                         }
                         raw_thetas_with_position.append({
                             'value': theta_value,
+                            'gradient': theta_grad,
                             'position': position_info
                         })
-                else:  # Should not happen if module.layers contains only MZIlayer_row/column
-                    print(
-                        f"Warning: Encountered unexpected layer type or structure in SingleChannelFilter.layers[{scf_layer_idx}]")
+                else:
+                    print(f"Warning: Encountered unexpected layer type or structure in SingleChannelFilter.layers[{scf_layer_idx}]")
 
             current_filter_data['raw_sin_thetas_with_position'] = raw_thetas_with_position
             collected_filter_internals[key] = current_filter_data
@@ -142,13 +133,11 @@ def collect_and_save_filter_data(model, dataloader, device, save_dir="filter_dat
                     )
                     hook_handles.append(handle)
                 else:
-                    print(
-                        f"警告: 在 CNN 层 {cnn_layer_idx} 中找到非 SingleChannelFilter 模块: {type(single_channel_filter_module)}")
+                    print(f"警告: 在 CNN 层 {cnn_layer_idx} 中找到非 SingleChannelFilter 模块: {type(single_channel_filter_module)}")
 
     if not hook_handles:
         print("警告: 没有为任何 SingleChannelFilter 注册钩子。请检查模型结构。")
-        # Potentially return or handle if no hooks means no data can be collected.
-        # For now, it will proceed and likely save an empty 'filter_internals'.
+        return
 
     with torch.no_grad():
         final_model_output = model(single_input_image)
@@ -162,7 +151,7 @@ def collect_and_save_filter_data(model, dataloader, device, save_dir="filter_dat
         'filter_internals': collected_filter_internals
     }
 
-    save_path = os.path.join(save_dir, 'collected_filter_simulation_data_with_position.npy')  # Changed filename
+    save_path = os.path.join(save_dir, 'collected_filter_simulation_data_with_position.npy')
     np.save(save_path, complete_data_to_save)
     print(f"收集到的滤波器仿真数据（包含位置信息）已保存至: {save_path}")
 
@@ -198,16 +187,23 @@ def main():
         torch.cuda.manual_seed(args.seed)
         torch.cuda.empty_cache()
     
-    # Define data preprocessing pipeline
-    transform = transforms.Compose([
+    # Define data preprocessing pipeline for training
+    train_transform = transforms.Compose([
         transforms.Resize((args.input_size, args.input_size)),
         transforms.ToTensor(),
-        # transforms.Normalize((0.1307,), (0.3081,))  # mapping [0, 1] to Normal distribution
+        transforms.Normalize((0.1307,), (0.3081,))  # mapping [0, 1] to Normal distribution
+    ])
+    
+    # Define data preprocessing pipeline for data collection (without normalization)
+    collect_transform = transforms.Compose([
+        transforms.Resize((args.input_size, args.input_size)),
+        transforms.ToTensor(),
     ])
     
     # Load MNIST dataset
-    train_dataset = datasets.MNIST('../data', train=True, download=True, transform=transform)
-    test_dataset = datasets.MNIST('../data', train=False, transform=transform)
+    train_dataset = datasets.MNIST('../data', train=True, download=True, transform=train_transform)
+    test_dataset = datasets.MNIST('../data', train=False, transform=train_transform)
+    collect_dataset = datasets.MNIST('../data', train=False, transform=collect_transform)
     
     # Create data loaders
     train_loader = DataLoader(
@@ -218,6 +214,11 @@ def main():
     test_loader = DataLoader(
         test_dataset, 
         batch_size=args.test_batch_size, 
+        shuffle=False
+    )
+    collect_loader = DataLoader(
+        collect_dataset,
+        batch_size=1,
         shuffle=False
     )
     
@@ -258,15 +259,9 @@ def main():
             print_memory_stats()
             torch.cuda.empty_cache()
 
-    # 训练完成后，收集并保存滤波器数据
+    # 训练完成后，收集并保存滤波器数据（使用未归一化的数据）
     print("收集滤波器数据...")
-    collect_and_save_filter_data(model, test_loader, device)
-    # 如果模型已经训练并保存，可以先加载模型
-    # if os.path.exists("optical_network.pt"):
-    #     print("从 optical_network.pt 加载已训练模型...")
-    #     model.load_state_dict(torch.load("optical_network.pt", map_location=device))
-    # else:
-    #     print("警告: 未找到 optical_network.pt。将使用当前（可能未充分训练的）模型状态收集数据。")
+    collect_and_save_filter_data(model, collect_loader, device)
     
     # Save model if requested
     if args.save_model:
