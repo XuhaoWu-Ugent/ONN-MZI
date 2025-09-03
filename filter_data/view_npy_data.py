@@ -2,7 +2,7 @@ import numpy as np
 
 # 定义要加载的文件名
 # 假设 'collected_filter_simulation_data.npy' 文件与此脚本在同一目录下
-file_path = 'collected_filter_simulation_data_with_position.npy'
+file_path = 'C:\\Users\\17958\\ONN-MZI\\filter_data\\hook_data_verified.npy'
 
 # 设置打印选项，以便完整显示数组（如果需要，但要注意大型数组的输出）
 # np.set_printoptions(threshold=np.inf) # 取消注释这行可以尝试打印完整的大型数组
