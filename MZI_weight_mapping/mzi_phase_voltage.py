@@ -235,6 +235,5 @@ if __name__ == "__main__":
     result_df = extract_voltage_phase_relationship(csv_filename)
 
     if result_df is not None:
-        print(f"\n✅ 电压-相位对应关系提取完成！")
-        print(f"📁 输出文件: Voltage_Phase_Correspondence.csv")
-        print(f"📊 包含 {len(result_df)} 个数据点的一一对应关系")
+        print(f" 输出文件: Voltage_Phase_Correspondence.csv")
+        print(f" 包含 {len(result_df)} 个数据点的一一对应关系")

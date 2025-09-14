@@ -6,7 +6,7 @@ import time
 from module.channel import SingleChannelFilter
 
 class CNN_layer(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size, mzi_repeat_num ,mzi_row_num,mzi_column_num):
+    def __init__(self, in_channels, out_channels, kernel_size, mzi_repeat_num, mzi_row_num, mzi_column_num):
         """
         Initialize CNN layer with multiple single channel filters
         
