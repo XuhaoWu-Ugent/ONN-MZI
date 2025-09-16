@@ -46,18 +46,32 @@ class MLP(nn.Module):
             self.fc2.append(MZIlayer_column(num=4))
         self.fc2.append(MZIlayer_row(num=5))
 
+        # Add fc3 layer, identical to fc1 and fc2
+        self.fc3 = nn.ModuleList()
+        for _ in range(5):
+            self.fc3.append(MZIlayer_row(num=5))
+            self.fc3.append(MZIlayer_column(num=4))
+        self.fc3.append(MZIlayer_row(num=5))
+
         self.drop = nn.Dropout(drop)
 
     def forward(self, x):
-        # Process through first MZI chain
+        # Process through first MZI chain (hidden layer 1)
         for layer in self.fc1:
             x = layer(x)
         x = torch.abs(x)  # Take magnitude for real activation
         x = F.gelu(x)
         x = self.drop(x)
 
-        # Process through second MZI chain
+        # Process through second MZI chain (hidden layer 2)
         for layer in self.fc2:
+            x = layer(x)
+        x = torch.abs(x)
+        x = F.gelu(x)  # Add GELU for consistency as it's a hidden layer now
+        x = self.drop(x)
+
+        # Process through third MZI chain (output layer)
+        for layer in self.fc3:
             x = layer(x)
         x = torch.abs(x)
         x = self.drop(x)
