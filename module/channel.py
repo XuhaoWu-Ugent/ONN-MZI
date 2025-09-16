@@ -43,6 +43,31 @@ class SingleChannelFilter(nn.Module):
         # Store matrix size for dynamic computation
         self.matrix_size = 2 * self.num_ports  # 20x20
 
+        # Pre-allocate combined transfer matrix (cached only in eval mode)
+        self._combined_matrix = None
+        # Remove gradient accumulation counter to prevent training issues
+
+    def _get_combined_matrix(self, device):
+        """
+        Get combined transfer matrix with training-safe caching
+        CRITICAL: Always rebuild in training mode to prevent gradient graph issues
+        """
+        # TRAINING MODE: Always rebuild matrix to avoid gradient conflicts
+        if self.training:
+            # Always create fresh matrix during training
+            return self._build_combined_transfer_matrix(device)
+
+        # EVAL MODE: Use caching for performance
+        should_update = (self._combined_matrix is None or
+                        self._combined_matrix.device != device)
+
+        if should_update:
+            self._combined_matrix = self._build_combined_transfer_matrix(device)
+            # Detach to prevent gradient issues when switching between modes
+            self._combined_matrix = self._combined_matrix.detach().clone()
+
+        return self._combined_matrix
+
     def _build_combined_transfer_matrix(self, device):
         """
         Build combined transfer matrix by multiplying all layer matrices
@@ -50,7 +75,7 @@ class SingleChannelFilter(nn.Module):
         """
         # Start with identity matrix
         combined_matrix = torch.eye(self.matrix_size, dtype=torch.complex64, device=device)
-        
+
         # Multiply matrices in reverse order (right to left multiplication)
         # This ensures proper composition: output = M_n * M_{n-1} * ... * M_1 * input
         for layer in reversed(self.layers):
@@ -58,7 +83,7 @@ class SingleChannelFilter(nn.Module):
             layer_matrix = layer._build_transfer_matrix(device)
             # Matrix multiplication: combined = current_layer * previous_combined
             combined_matrix = torch.matmul(layer_matrix, combined_matrix)
-        
+
         return combined_matrix
 
     def get_all_time(self):
@@ -89,6 +114,13 @@ class SingleChannelFilter(nn.Module):
                     total_stats[key] += layer_stats[key]
         
         return total_stats
+
+    def train(self, mode=True):
+        """Override train() to clear cache when switching to training mode"""
+        super().train(mode)
+        if mode:  # Entering training mode
+            self._combined_matrix = None  # Clear cached matrix to prevent gradient issues
+        return self
 
     def forward(self, x, return_intermediate=False):
         """
@@ -127,24 +159,27 @@ class SingleChannelFilter(nn.Module):
         # Convert to complex type for complex operations (same as original)
         patches = patches.to(torch.complex64)
 
-        # NEW: Process through combined transfer matrix instead of sequential layers
+        # NEW: Process through combined transfer matrix with optimized batch operations
         batch_size, num_patches, num_ports = patches.shape
-        output_patches = torch.zeros_like(patches)
 
-        # Build combined transfer matrix dynamically
-        combined_matrix = self._build_combined_transfer_matrix(patches.device)
+        # Get or update combined transfer matrix with gradient accumulation
+        combined_matrix = self._get_combined_matrix(patches.device)
 
-        for b in range(batch_size):
-            for p in range(num_patches):
-                # Build state vector: [input state, zero output state]
-                state_vector = torch.zeros(self.matrix_size, dtype=torch.complex64, device=patches.device)
-                state_vector[:num_ports] = patches[b, p, :]
-                
-                # Apply combined transfer matrix transformation
-                new_state = torch.matmul(combined_matrix, state_vector)
-                
-                # Extract output state (forward propagation result)
-                output_patches[b, p, :] = new_state[self.num_ports:self.num_ports + num_ports]
+        # Batch processing without loops - pre-allocate all tensors
+        batch_total = batch_size * num_patches
+        patches_flat = patches.view(batch_total, num_ports)
+
+        # Create state vectors for entire batch at once
+        state_vectors = torch.zeros(batch_total, self.matrix_size,
+                                   dtype=torch.complex64, device=patches.device)
+        state_vectors[:, :num_ports] = patches_flat
+
+        # Batch matrix multiplication - process entire batch at once
+        new_states = torch.matmul(state_vectors, combined_matrix.T)
+
+        # Extract outputs for entire batch
+        output_flat = new_states[:, self.num_ports:self.num_ports + num_ports]
+        output_patches = output_flat.view(batch_size, num_patches, num_ports)
 
         # Save MZI processed first patch if needed (same as original)
         if return_intermediate:
