@@ -24,7 +24,7 @@ def print_memory_stats():
 
 def main():
     """
-    Main function: Implements the training and testing pipeline on MNIST dataset
+    Main function: Implements the training and testing pipeline on CIFAR dataset
     """
     print("1111111111111111111111111111111111111111111111111111")
 

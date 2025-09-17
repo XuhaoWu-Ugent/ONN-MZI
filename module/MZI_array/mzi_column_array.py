@@ -221,12 +221,13 @@ class MZIlayer_column(nn.Module):
         Avoids tensor reuse issues that cause gradient graph problems
 
         Args:
-            input (torch.Tensor): Input tensor (batch, num_patches, num_ports)
+            input (torch.Tensor): Input tensor (batch, height, width, num_ports)
 
         Returns:
-            torch.Tensor: Output tensor (batch, num_patches, num_ports)
+            torch.Tensor: Output tensor (batch, height, width, num_ports)
         """
-        batch_size, num_patches, num_ports = input.shape
+        batch_size, height, width, num_ports = input.shape
+        num_patches = height * width
         batch_total = batch_size * num_patches
 
         # Ensure input is complex type
@@ -236,8 +237,11 @@ class MZIlayer_column(nn.Module):
         # Get transfer matrix (with caching)
         transfer_matrix = self._build_transfer_matrix(input.device)
 
+        # Reshape 4D input to 3D for processing: (batch, height, width, ports) -> (batch, num_patches, ports)
+        input_3d = input.view(batch_size, num_patches, num_ports)
+
         # Optimized vectorized processing with pre-allocation
-        input_flat = input.view(batch_total, num_ports)
+        input_flat = input_3d.view(batch_total, num_ports)
 
         # TRAINING MODE: Always create fresh tensors to avoid gradient graph issues
         if self.training:
@@ -270,7 +274,10 @@ class MZIlayer_column(nn.Module):
         # Extract output
         output_flat = new_states[:, self.num_ports:self.num_ports + num_ports]
 
-        # Reshape back to original format
-        output = output_flat.view(batch_size, num_patches, num_ports)
+        # Reshape back to 3D format first
+        output_3d = output_flat.view(batch_size, num_patches, num_ports)
+
+        # Reshape back to original 4D format: (batch, num_patches, ports) -> (batch, height, width, ports)
+        output = output_3d.view(batch_size, height, width, num_ports)
 
         return output
