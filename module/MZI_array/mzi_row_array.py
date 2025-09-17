@@ -5,86 +5,271 @@ import torch.nn.functional as F
 import numpy as np
 from module.MZI_array.mzi import MZI
 
+
 class MZIlayer_row(nn.Module):
-    def __init__(self, num):
-        """Initialize a row of MZI (Mach-Zehnder Interferometer) modules"""
-        super().__init__()
-        # Create a list of 5 MZI modules
-        self.MZI = nn.ModuleList([MZI() for _ in range(num)])  # n MZIs per row(default 5)
-        # Flag for debugging/tracking purposes
+    """
+    Fixed ultra-fast MZI Row Array implementation
+    Solves gradient graph issues while maintaining performance
+    """
+
+    def __init__(self, num=5):
+        """
+        Args:
+            num (int): Number of MZIs, default 5 (corresponding to 10-port system)
+        """
+        super(MZIlayer_row, self).__init__()
+        self.num = num
+        self.num_ports = num * 2
+
+        # Create MZI instances (maintain consistent naming with original interface)
+        self.MZI = nn.ModuleList([MZI() for _ in range(num)])
+        self.mzis = self.MZI  # Backward compatibility alias
+
+        # Add attributes compatible with original implementation
         self.flag = 0
-        # Dictionary to store timing statistics
         self.timing_stats = {'allocation': 0, 'computation': 0, 'total': 0}
-        
+
+        # Store matrix size for dynamic computation
+        self.matrix_size = 2 * self.num_ports
+
+        # Smart caching with parameter tracking
+        self._cached_matrix = None
+        self._cached_device = None
+        self._parameter_hash = None
+        self._cache_hits = 0
+        self._cache_misses = 0
+
+        # Pre-allocate tensors for batch operations
+        self._max_batch_size = 1024  # Reasonable default
+        self._preallocated_state_vectors = None
+        self._preallocated_outputs = None
+
+    def _compute_parameter_hash(self):
+        """Compute a hash of all parameters for efficient change detection"""
+        params = []
+        for mzi in self.MZI:
+            params.append(mzi.raw_sin_theta.data.item())
+        return hash(tuple(params))
+
+    def _is_cache_valid(self, device):
+        """Fast cache validation - NEVER cache in training mode to avoid gradient issues"""
+        # CRITICAL: Never cache during training to prevent gradient graph issues
+        if (self._cached_matrix is None or
+            self._cached_device != device or
+            self.training):
+            return False
+
+        # Fast parameter change detection
+        current_hash = self._compute_parameter_hash()
+        return current_hash == self._parameter_hash
+
+    def _build_transfer_matrix(self, device):
+        """Optimized matrix building with caching"""
+        # Check cache validity first
+        if self._is_cache_valid(device):
+            self._cache_hits += 1
+            return self._cached_matrix
+
+        self._cache_misses += 1
+
+        # Build matrix efficiently with batch operations
+        matrix = torch.zeros((self.matrix_size, self.matrix_size),
+                           dtype=torch.complex64, device=device)
+
+        # True batch processing for all MZI matrices
+        if self.num > 0:
+            # Create batch input for all MZIs at once
+            identity_4x4 = torch.eye(4, dtype=torch.complex64, device=device)
+            batch_identity = identity_4x4.unsqueeze(0).repeat(self.num, 1, 1)  # (num_mzi, 4, 4)
+
+            # Compute all MZI matrices using proper 4-port MZI transform
+            # This preserves the original MZI.forward() behavior for bidirectional support
+            identity_4x4 = torch.eye(4, dtype=torch.complex64, device=device)
+            batch_identity = identity_4x4.unsqueeze(0).repeat(self.num, 1, 1)  # (num_mzi, 4, 4)
+
+            # Stack all MZI parameters for batch processing
+            batch_sin_theta = []
+            batch_cos_theta = []
+            for mzi in self.MZI:
+                sin_val, cos_val = mzi.get_sin_cos()
+                # Ensure scalar values by squeezing
+                batch_sin_theta.append(sin_val.squeeze().to(torch.complex64))
+                batch_cos_theta.append(cos_val.squeeze().to(torch.complex64))
+
+            sin_theta_batch = torch.stack(batch_sin_theta)  # (num_mzi,)
+            cos_theta_batch = torch.stack(batch_cos_theta)  # (num_mzi,)
+
+            # Batch compute MZI transformations using the actual MZI forward logic
+            # This replicates the behavior of MZI.forward() for 4-port configuration
+            mzi_matrices = torch.zeros(self.num, 4, 4, dtype=torch.complex64, device=device)
+
+            # Apply vectorized MZI transformation for all MZIs at once
+            for j in range(4):
+                input_vec = batch_identity[:, :, j]  # (num_mzi, 4)
+
+                # Vectorized cosine and sine components
+                x_c = input_vec * cos_theta_batch.unsqueeze(-1)  # (num_mzi, 4)
+                x_s = input_vec * (-1j * sin_theta_batch.unsqueeze(-1))  # (num_mzi, 4)
+
+                # Apply MZI transformation logic (vectorized version of MZI.forward)
+                output_port_0 = x_c[..., 2] + x_s[..., 3]  # (num_mzi,)
+                output_port_1 = x_c[..., 3] + x_s[..., 2]  # (num_mzi,)
+                output_port_2 = x_c[..., 0] + x_s[..., 1]  # (num_mzi,)
+                output_port_3 = x_c[..., 1] + x_s[..., 0]  # (num_mzi,)
+
+                # Assign each output port to the corresponding row of column j
+                mzi_matrices[:, 0, j] = output_port_0
+                mzi_matrices[:, 1, j] = output_port_1
+                mzi_matrices[:, 2, j] = output_port_2
+                mzi_matrices[:, 3, j] = output_port_3
+
+            # Vectorized assembly preserving bidirectional functionality
+            port_indices = torch.arange(self.num, device=device)
+            port1_indices = port_indices * 2
+            port2_indices = port_indices * 2 + 1
+
+            # Forward direction (input → output) - vectorized assignment
+            matrix[self.num_ports + port1_indices, port1_indices] = mzi_matrices[:, 2, 0]
+            matrix[self.num_ports + port1_indices, port2_indices] = mzi_matrices[:, 2, 1]
+            matrix[self.num_ports + port2_indices, port1_indices] = mzi_matrices[:, 3, 0]
+            matrix[self.num_ports + port2_indices, port2_indices] = mzi_matrices[:, 3, 1]
+
+            # Reverse direction (output → input) - vectorized assignment
+            matrix[port1_indices, self.num_ports + port1_indices] = mzi_matrices[:, 0, 2]
+            matrix[port1_indices, self.num_ports + port2_indices] = mzi_matrices[:, 0, 3]
+            matrix[port2_indices, self.num_ports + port1_indices] = mzi_matrices[:, 1, 2]
+            matrix[port2_indices, self.num_ports + port2_indices] = mzi_matrices[:, 1, 3]
+
+            # Self-coupling terms (input-input and output-output) - vectorized assignment
+            matrix[port1_indices, port1_indices] = mzi_matrices[:, 0, 0]
+            matrix[port1_indices, port2_indices] = mzi_matrices[:, 0, 1]
+            matrix[port2_indices, port1_indices] = mzi_matrices[:, 1, 0]
+            matrix[port2_indices, port2_indices] = mzi_matrices[:, 1, 1]
+
+            matrix[self.num_ports + port1_indices, self.num_ports + port1_indices] = mzi_matrices[:, 2, 2]
+            matrix[self.num_ports + port1_indices, self.num_ports + port2_indices] = mzi_matrices[:, 2, 3]
+            matrix[self.num_ports + port2_indices, self.num_ports + port1_indices] = mzi_matrices[:, 3, 2]
+            matrix[self.num_ports + port2_indices, self.num_ports + port2_indices] = mzi_matrices[:, 3, 3]
+
+        # Update cache with hash for fast validation - ONLY in eval mode
+        if not self.training:
+            # Use detach() to break gradient connection for cached matrices
+            self._cached_matrix = matrix.detach().clone()  # Clone to ensure no sharing
+            self._cached_device = device
+            self._parameter_hash = self._compute_parameter_hash()
+
+        return matrix
+
+    def get_cache_stats(self):
+        """Get cache performance statistics"""
+        total = self._cache_hits + self._cache_misses
+        hit_rate = self._cache_hits / total if total > 0 else 0
+        return {
+            'cache_hits': self._cache_hits,
+            'cache_misses': self._cache_misses,
+            'hit_rate': hit_rate
+        }
+
+    def _preallocate_tensors(self, batch_size, device):
+        """Pre-allocate tensors for batch operations"""
+        self._preallocated_state_vectors = torch.zeros(
+            batch_size, self.matrix_size, dtype=torch.complex64, device=device)
+        self._preallocated_outputs = torch.zeros(
+            batch_size, self.num_ports, dtype=torch.complex64, device=device)
+
+    def clear_cache(self):
+        """Clear all caches and pre-allocated tensors"""
+        self._cached_matrix = None
+        self._cached_device = None
+        self._parameter_hash = None
+        self._preallocated_state_vectors = None
+        self._preallocated_outputs = None
+
+    def train(self, mode=True):
+        """Override train() to clear cache when switching to training mode"""
+        super().train(mode)
+        if mode:  # Entering training mode
+            self.clear_cache()  # Clear all cached tensors to prevent gradient issues
+        return self
+
     def get_all_time(self):
-        """
-        Recursively collect timing statistics from all MZI modules
-        Returns:
-            Dictionary containing accumulated timing statistics
-        """
+        """Recursively collect timing statistics from all MZI modules"""
         total_stats = {'allocation': 0, 'computation': 0, 'total': 0}
-        
-        # Add current layer's timing stats
+
         for key in total_stats:
             if hasattr(self, 'timing_stats'):
                 total_stats[key] += self.timing_stats[key]
-        
-        # Recursively add timing stats from all child MZI modules
+
         if hasattr(self, 'MZI'):
             for layer in self.MZI:
-                # If child has get_all_time method, call it
                 if hasattr(layer, 'get_all_time'):
                     layer_stats = layer.get_all_time()
-                # Otherwise try to get timing_stats directly
                 elif hasattr(layer, 'timing_stats'):
                     layer_stats = layer.timing_stats
                 else:
                     continue
-                    
-                # Accumulate child layer timing stats
+
                 for key in total_stats:
                     total_stats[key] += layer_stats[key]
-        
+
         return total_stats
-        
+
     def forward(self, input):
         """
-        Forward pass through the MZI row
-        Args:
-            input: Input tensor of shape (batch_size, height, width, 10)
-        Returns:
-            Transformed tensor of shape (batch_size, height, width, 10)
-        """
-        # Extract input dimensions
-        batch_size, height, width, _ = input.shape
-        MZI_num = len(self.MZI)
-        
-        # Reshape input to match MZI structure (batch_size, height, width, MZI_num, 2)
-        input_reshaped = input.view(batch_size, height, width, MZI_num, 2)
-        
-        # Prepare full 4-element input for each MZI by padding with zeros
-        full_input = torch.zeros(batch_size, height, width, MZI_num, 4, 
-                                 dtype=torch.complex64, device=input.device)
-        full_input[..., 2:] = input_reshaped  # 填充最后两个位置为 reshaped 的输入
-        
-        # 初始化输出列表
-        outputs = []
-        for i, mzi in enumerate(self.MZI):
-            # 选择当前 MZI 的输入 (batch_size, height, width, 4)
-            mzi_input = full_input[:, :, :, i, :]
-            
-            # 展平输入以便传递给 MZI (batch_size * height * width, 4)
-            mzi_input_flat = mzi_input.view(-1, 4)
-            
-            # 通过 MZI 处理并恢复形状 (batch_size, height, width, 4)
-            mzi_output = mzi(mzi_input_flat).view(batch_size, height, width, 4)
-            
-            # 只保留前两个元素 (batch_size, height, width, 2)
-            outputs.append(mzi_output[..., :2])
-        
-        # 堆叠所有 MZI 的输出 (batch_size, height, width, MZI_num, 2)
-        output = torch.stack(outputs, dim=3)
-        
-        # 最终调整输出形状为 (batch_size, height, width, 10)
-        return output.view(batch_size, height, width, -1)
+        Fixed ultra-fast forward propagation
+        Avoids tensor reuse issues that cause gradient graph problems
 
+        Args:
+            input (torch.Tensor): Input tensor (batch, num_patches, num_ports)
+
+        Returns:
+            torch.Tensor: Output tensor (batch, num_patches, num_ports)
+        """
+        batch_size, num_patches, num_ports = input.shape
+        batch_total = batch_size * num_patches
+
+        # Ensure input is complex type
+        if not input.dtype.is_complex:
+            input = input.to(dtype=torch.complex64)
+
+        # Get transfer matrix (with caching)
+        transfer_matrix = self._build_transfer_matrix(input.device)
+
+        # Optimized vectorized processing with pre-allocation
+        input_flat = input.view(batch_total, num_ports)
+
+        # TRAINING MODE: Always create fresh tensors to avoid gradient graph issues
+        if self.training:
+            # Always create new tensors during training to prevent gradient conflicts
+            state_vectors = torch.zeros(batch_total, self.matrix_size,
+                                      dtype=torch.complex64, device=input.device)
+            state_vectors[:, :num_ports] = input_flat
+        else:
+            # EVAL MODE: Use pre-allocated tensors for performance
+            if batch_total <= self._max_batch_size:
+                # Ensure pre-allocated tensors exist and have correct size
+                if (self._preallocated_state_vectors is None or
+                    self._preallocated_state_vectors.size(0) < batch_total or
+                    self._preallocated_state_vectors.device != input.device):
+                    self._preallocate_tensors(batch_total, input.device)
+
+                # Use pre-allocated tensors (safe in eval mode)
+                state_vectors = self._preallocated_state_vectors[:batch_total]
+                state_vectors.zero_()  # Clear previous values
+                state_vectors[:, :num_ports] = input_flat
+            else:
+                # Fall back to dynamic allocation for very large batches
+                state_vectors = torch.zeros(batch_total, self.matrix_size,
+                                          dtype=torch.complex64, device=input.device)
+                state_vectors[:, :num_ports] = input_flat
+
+        # Batch matrix multiplication
+        new_states = torch.matmul(state_vectors, transfer_matrix.T)
+
+        # Extract output
+        output_flat = new_states[:, self.num_ports:self.num_ports + num_ports]
+
+        # Reshape back to original format
+        output = output_flat.view(batch_size, num_patches, num_ports)
+
+        return output

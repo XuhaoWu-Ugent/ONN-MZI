@@ -5,10 +5,12 @@ from torchvision import datasets, transforms
 import wandb
 from module.ONN import OpticalNetwork  
 from train import train, test
-from torch.amp import GradScaler
+from torch.cuda.amp import GradScaler
 from args import get_args
 import random
 import numpy as np
+
+
 def print_memory_stats():
     """
     Print current CUDA memory usage statistics
