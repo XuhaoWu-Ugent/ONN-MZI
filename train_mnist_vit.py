@@ -165,9 +165,9 @@ class CFG:
     embed: int = 10
     depth: int = 8
     heads: int = 2
-    epochs: int = 25
+    epochs: int = 35
     batch_size: int = 256
-    lr: float = 3e-4
+    lr: float = 5e-4
     weight_decay: float = 5e-2
     label_smoothing: float = 0.1
     num_workers: int = 4
