@@ -3,23 +3,24 @@ import torch.cuda
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
 import wandb
-from module.ONN import OpticalNetwork
-from module.CNN import CNN_layer
+from module.ONN_enhanced import OpticalNetworkEnhanced
+from module.CNN_enhanced import CNN_layer_enhanced
 from module.channel import SingleChannelFilter
+from module.channel_power import SingleChannelFilterPower
 from module.MZI_array.mzi_row_array import MZIlayer_row
 from module.MZI_array.mzi_column_array import MZIlayer_column
 from train import train, test
 from torch.cuda.amp import GradScaler
-from args import get_args
+from args_enhanced import get_args
 import random
 import numpy as np
 import os
-import json
 
 
-def collect_and_save_filter_data(model, dataloader, device, save_dir="filter_data"):
+def collect_and_save_filter_data_enhanced(model, dataloader, device, save_dir="filter_data", filter_type='coherent'):
     """
-    收集并保存模型各层滤波器的特定数据，新版将明确区分吸收器前后的数据，并恢复所有参数的收集。
+    Enhanced version of data collection function that works with all filter types
+    Collects and saves internal data from optical filters with proper handling for different detection modes
     """
     os.makedirs(save_dir, exist_ok=True)
     model.eval()
@@ -27,7 +28,7 @@ def collect_and_save_filter_data(model, dataloader, device, save_dir="filter_dat
     collected_filter_internals = {}
     hook_handles = []
 
-    def get_filter_internal_data_hook(layer_idx, filter_idx_in_cnn_layer, cnn_layer_in_channels):
+    def get_filter_internal_data_hook_enhanced(layer_idx, filter_idx_in_cnn_layer, cnn_layer_in_channels, filter_type):
         def hook(module, input_args, output_tensor_overall_filter):
             input_for_intermediate_calc = input_args[0][0:1, :, :]
 
@@ -37,7 +38,16 @@ def collect_and_save_filter_data(model, dataloader, device, save_dir="filter_dat
 
             with torch.no_grad():
                 patches_for_weighting = mzi_output_before_absorber_patch.view(1, 1, -1)
-                output_after_absorber_patch = patches_for_weighting * module.diagonal_matrix.view(1, 1, -1)
+
+                if filter_type == 'coherent':
+                    # Coherent detection: complex amplitude processing
+                    output_after_absorber_patch = patches_for_weighting * module.diagonal_matrix.view(1, 1, -1)
+                elif filter_type == 'power':
+                    # Power-domain detection: power superposition
+                    power_patches = torch.abs(patches_for_weighting) ** 2
+                    output_after_absorber_patch = power_patches * (module.diagonal_matrix.abs() ** 2).view(1, 1, -1)
+                else:
+                    output_after_absorber_patch = patches_for_weighting * module.diagonal_matrix.view(1, 1, -1)
 
             key = f'layer_{layer_idx}_filter_{filter_idx_in_cnn_layer}'
             current_filter_data = {}
@@ -45,6 +55,7 @@ def collect_and_save_filter_data(model, dataloader, device, save_dir="filter_dat
             current_filter_data['mzi_array_input'] = mzi_array_input_patch.detach().cpu().numpy()
             current_filter_data['mzi_output_before_absorber'] = mzi_output_before_absorber_patch.detach().cpu().numpy()
             current_filter_data['output_after_absorber'] = output_after_absorber_patch.detach().cpu().numpy()
+            current_filter_data['filter_type'] = filter_type
 
             ks = module.kernel_size
             mzi_array_io_waveguide_desc = []
@@ -112,20 +123,23 @@ def collect_and_save_filter_data(model, dataloader, device, save_dir="filter_dat
         image_batch, _ = next(data_iter)
         single_input_image = image_batch[0:1].to(device)
     except StopIteration:
-        print("错误：数据加载器为空，无法获取图像。" )
+        print("Error: Dataloader is empty, cannot get image.")
         return
 
+    # Get filter type from model
+    model_filter_type = model.filter_type if hasattr(model, 'filter_type') else filter_type
+
     for cnn_layer_idx, cnn_layer_module in enumerate(model.layers):
-        if isinstance(cnn_layer_module, CNN_layer):
+        if isinstance(cnn_layer_module, CNN_layer_enhanced):
             for filter_idx_in_cnn, single_channel_filter_module in enumerate(cnn_layer_module.filters):
-                if isinstance(single_channel_filter_module, SingleChannelFilter):
+                if isinstance(single_channel_filter_module, (SingleChannelFilter, SingleChannelFilterPower)):
                     handle = single_channel_filter_module.register_forward_hook(
-                        get_filter_internal_data_hook(cnn_layer_idx, filter_idx_in_cnn, cnn_layer_module.in_channels)
+                        get_filter_internal_data_hook_enhanced(cnn_layer_idx, filter_idx_in_cnn, cnn_layer_module.in_channels, model_filter_type)
                     )
                     hook_handles.append(handle)
 
     if not hook_handles:
-        print("警告: 没有为任何 SingleChannelFilter 注册钩子。" )
+        print("Warning: No hooks registered for any SingleChannelFilter.")
         return
 
     # Run a forward and dummy backward pass to populate gradients for collection
@@ -141,12 +155,15 @@ def collect_and_save_filter_data(model, dataloader, device, save_dir="filter_dat
     complete_data_to_save = {
         'input_image_to_model': single_input_image.cpu().numpy(),
         'final_model_output': final_model_output.detach().cpu().numpy(),
-        'filter_internals': collected_filter_internals
+        'filter_internals': collected_filter_internals,
+        'model_filter_type': model_filter_type,
+        'model_info': model.get_filter_info() if hasattr(model, 'get_filter_info') else {}
     }
 
-    save_path = os.path.join(save_dir, 'hook_data_verified.npy')
+    save_filename = f'hook_data_verified_{model_filter_type}.npy'
+    save_path = os.path.join(save_dir, save_filename)
     np.save(save_path, complete_data_to_save)
-    print(f"已验证的、包含明确分段的Hook数据已保存至: {save_path}")
+    print(f"Enhanced hook data for {model_filter_type} mode saved to: {save_path}")
 
 
 def print_memory_stats():
@@ -156,40 +173,43 @@ def print_memory_stats():
     print(f"Allocated: {torch.cuda.memory_allocated() / 1024**2:.2f}MB")
     print(f"Cached: {torch.cuda.memory_reserved() / 1024**2:.2f}MB")
 
+
 def main():
     """
-    Main function: Implements the training and testing pipeline on MNIST dataset
+    Main function: Implements the training and testing pipeline on MNIST dataset with enhanced filter support
     """
     args = get_args()
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     device = torch.device("cuda" if not args.no_cuda and torch.cuda.is_available() else "cpu")
-    
+
     if device.type == 'cuda':
         torch.cuda.manual_seed(args.seed)
         torch.cuda.empty_cache()
-    
+
     train_transform = transforms.Compose([
         transforms.Resize((args.input_size, args.input_size)),
         transforms.ToTensor(),
         transforms.Normalize((0.1307,), (0.3081,))
     ])
-    
+
     collect_transform = transforms.Compose([
         transforms.Resize((args.input_size, args.input_size)),
         transforms.ToTensor(),
     ])
-    
+
     train_dataset = datasets.MNIST('../data', train=True, download=True, transform=train_transform)
     test_dataset = datasets.MNIST('../data', train=False, transform=train_transform)
     collect_dataset = datasets.MNIST('../data', train=False, transform=collect_transform)
-    
+
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=args.test_batch_size, shuffle=False)
     collect_loader = DataLoader(collect_dataset, batch_size=1, shuffle=False)
-    
-    model = OpticalNetwork(
+
+    # Create enhanced model
+    # Supported filter types: 'coherent' (amplitude interference) or 'power' (power superposition)
+    model = OpticalNetworkEnhanced(
         input_channels=args.input_channels,
         hidden_channels=args.hidden_channels,
         output_size=args.output_size,
@@ -197,62 +217,45 @@ def main():
         kernel_size=args.kernel_size,
         mzi_repeat_num=args.mzi_repeat_num,
         mzi_row_num=args.mzi_row_num,
-        mzi_column_num=args.mzi_column_num
+        mzi_column_num=args.mzi_column_num,
+        filter_type=args.filter_type
     ).to(device)
-    
+
+    # Print model configuration
+    print(f"\n=== Enhanced Optical Network Configuration ===")
+    print(f"Filter Type: {args.filter_type}")
+    if hasattr(model, 'get_filter_info'):
+        info = model.get_filter_info()
+        print(f"Detection Principle: {info['detection_principle']}")
+    print("=" * 50)
+
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
     scaler = GradScaler()
-    
+
     if args.wandb:
-        wandb.init(project="optical-neural-network")
+        wandb.init(project=f"optical-neural-network-{args.filter_type}")
         wandb.config.update(args)
 
-    # Initialize training log
-    training_log = {
-        'train_epochs': [],
-        'train_losses': [],
-        'train_accuracies': [],
-        'test_epochs': [],
-        'test_losses': [],
-        'test_accuracies': []
-    }
-
     for epoch in range(1, args.epochs + 1):
-        # Train and get epoch metrics
-        train_loss, train_acc = train(model, device, train_loader, optimizer, epoch, scaler,
-                                      clip_value=args.grad_clip, log_interval=args.log_interval, args=args)
-
-        # Test and get epoch metrics
-        test_loss, test_acc = test(model, device, test_loader)
-
-        # Log epoch metrics
-        training_log['train_epochs'].append(epoch)
-        training_log['train_losses'].append(train_loss)
-        training_log['train_accuracies'].append(train_acc)
-        training_log['test_epochs'].append(epoch)
-        training_log['test_losses'].append(test_loss)
-        training_log['test_accuracies'].append(test_acc)
+        train(model, device, train_loader, optimizer, epoch, scaler,
+              clip_value=args.grad_clip, log_interval=args.log_interval, args=args)
+        test(model, device, test_loader)
 
         if device.type == 'cuda':
             print_memory_stats()
             torch.cuda.empty_cache()
 
-    # Save training log to JSON
-    log_path = 'training_log.json'
-    with open(log_path, 'w') as f:
-        json.dump(training_log, f, indent=4)
-    print(f"\nTraining log saved to: {log_path}")
-
-    print("\n训练完成。开始收集和保存已验证的Hook数据...")
-    # 在这里，你需要确保模型已经加载了你想要分析的权重
-    # 例如: model.load_state_dict(torch.load('optical_network.pt'))
-    collect_and_save_filter_data(model, collect_loader, device)
+    print(f"\nTraining completed. Starting data collection for {args.filter_type} mode...")
+    collect_and_save_filter_data_enhanced(model, collect_loader, device, filter_type=args.filter_type)
 
     if args.save_model:
-        torch.save(model.state_dict(), "optical_network.pt")
+        model_filename = f"optical_network_{args.filter_type}.pt"
+        torch.save(model.state_dict(), model_filename)
+        print(f"Model saved as: {model_filename}")
 
     if args.wandb:
         wandb.finish()
+
 
 if __name__ == "__main__":
     main()

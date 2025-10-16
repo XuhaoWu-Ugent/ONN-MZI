@@ -1,10 +1,11 @@
-# arg.py
+# args_enhanced.py
+# Enhanced version with optical detection mode parameters
 
 import argparse
 
 def get_args():
     parser = argparse.ArgumentParser(description='Optical Neural Network Configuration')
-    
+
     # Network Architecture Parameters
     parser.add_argument('--input-size', type=int, default=14,
                         help='Input image size (default: 14)')
@@ -39,6 +40,11 @@ def get_args():
     parser.add_argument('--grad-clip', type=float, default=10.0,
                         help='Gradient clipping threshold (default: 10.0)')
 
+    # Detection Mode Parameters
+    parser.add_argument('--filter-type', type=str, default='coherent',
+                        choices=['coherent', 'power'],
+                        help='Filter type: coherent (amplitude interference) or power (power-domain superposition) (default: coherent)')
+
     # Other Parameters
     parser.add_argument('--no-cuda', action='store_true', default=False,
                         help='Disable CUDA training')
@@ -50,6 +56,6 @@ def get_args():
                         help='Save the trained model')
     parser.add_argument('--wandb', action='store_true', default=True,
                         help='Enable wandb logging for training process')
-    
+
     args = parser.parse_args()
     return args
