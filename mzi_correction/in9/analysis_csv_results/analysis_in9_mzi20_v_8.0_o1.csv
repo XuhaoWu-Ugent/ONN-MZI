@@ -1,0 +1,2 @@
+source_file,arithmetic_average_W,standard_deviation_W,minimum_power_W,maximum_power_W,coefficient_of_variation_percent,number_of_measurements,total_measurement_time_s,average_sampling_interval_ms
+mzi20\in9_mzi20_v_8.0_o1.csv,0.0002765573880898345,1.5954799606724844e-07,0.00027594369,0.000277094368,0.0576907372351312,423,61.516,145.77251184834122

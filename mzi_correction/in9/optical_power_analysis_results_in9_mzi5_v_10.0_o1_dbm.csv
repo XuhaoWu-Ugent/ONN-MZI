@@ -1,0 +1,2 @@
+arithmetic_average_dBm,standard_deviation_dBm,minimum_power_dBm,maximum_power_dBm,coefficient_of_variation_percent,number_of_measurements,total_measurement_time_s,average_sampling_interval_ms
+-4.415925862430168,0.005551656827918461,-4.42874527,-4.40252304,-0.1257189771945872,358,74.821,209.5826330532213

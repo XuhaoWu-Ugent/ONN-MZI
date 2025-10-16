@@ -1,0 +1,5 @@
+## input_port input_power input_mzi_number input_mzi_voltage output_port output_power
+0 5e-3 0 0 8 4.1e-5
+0 5e-3 0 1 8 4.2e-5
+0 5e-3 0 2 8 4.1e-5
+
