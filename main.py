@@ -195,9 +195,11 @@ def main():
         output_size=args.output_size,
         num_layers=args.num_layers,
         kernel_size=args.kernel_size,
+        input_size=args.input_size,
         mzi_repeat_num=args.mzi_repeat_num,
         mzi_row_num=args.mzi_row_num,
-        mzi_column_num=args.mzi_column_num
+        mzi_column_num=args.mzi_column_num,
+        detection_mode=args.detection_mode
     ).to(device)
     
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
