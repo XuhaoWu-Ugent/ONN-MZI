@@ -251,7 +251,21 @@ def main():
     collect_and_save_filter_data(model, collect_loader, device)
 
     if args.save_model:
-        torch.save(model.state_dict(), "optical_network.pt")
+        # Generate descriptive filename with configuration info
+        model_filename = (
+            f"optical_network_{args.detection_mode}_"
+            f"ch{args.hidden_channels}_"
+            f"layers{args.num_layers}_"
+            f"ep{args.epochs}_"
+            f"lr{args.lr}.pt"
+        )
+        torch.save(model.state_dict(), model_filename)
+        print(f"\n[Model Saved] {model_filename}")
+        print(f"  - Detection mode: {args.detection_mode}")
+        print(f"  - Hidden channels: {args.hidden_channels}")
+        print(f"  - Num layers: {args.num_layers}")
+        print(f"  - Epochs: {args.epochs}")
+        print(f"  - Learning rate: {args.lr}")
 
     if args.wandb:
         wandb.finish()
