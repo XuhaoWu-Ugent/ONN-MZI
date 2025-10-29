@@ -1,8 +1,7 @@
-from typing import Optional
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import numpy as np
 from module.MZI_array.mzi_column_array import MZIlayer_column
 from module.MZI_array.mzi_row_array import MZIlayer_row
 
@@ -48,36 +47,13 @@ class SingleChannelFilter(nn.Module):
         self.detection_mode = detection_mode
         self.num_ports = mzi_row_num * 2  # 10 ports for compatibility
 
-        # Create alternating row and column MZI layers with global indexing
+        # Create alternating row and column MZI layers
         # Structure: Row -> Column -> Row -> Column -> ... -> Row (2*repeat_num + 1 layers)
         self.layers = nn.ModuleList()
-        next_index = 0
-        mzi_kwargs = {}
-        for rep in range(repeat_num):
-            row_layer = MZIlayer_row(
-                num=mzi_row_num,
-                start_index=next_index,
-                mzi_kwargs=mzi_kwargs,
-            )
-            self.layers.append(row_layer)
-            next_index += mzi_row_num
-
-            column_layer = MZIlayer_column(
-                num=mzi_column_num,
-                start_index=next_index,
-                mzi_kwargs=mzi_kwargs,
-            )
-            self.layers.append(column_layer)
-            next_index += mzi_column_num
-
-        final_row = MZIlayer_row(
-            num=mzi_row_num,
-            start_index=next_index,
-            mzi_kwargs=mzi_kwargs,
-        )
-        self.layers.append(final_row)
-        next_index += mzi_row_num
-        self.total_mzis = next_index
+        for _ in range(repeat_num):
+            self.layers.append(MZIlayer_row(num=mzi_row_num))
+            self.layers.append(MZIlayer_column(num=mzi_column_num))
+        self.layers.append(MZIlayer_row(num=mzi_row_num))
 
         # Trainable diagonal weight matrix
         self.diagonal_matrix = nn.Parameter(torch.randn(self.num_ports))
@@ -92,45 +68,7 @@ class SingleChannelFilter(nn.Module):
         # Pre-allocate combined transfer matrix (cached only in eval mode)
         self._combined_matrix = None
 
-    def _prepare_voltages(
-        self,
-        voltages: Optional[torch.Tensor],
-        batch_size: int,
-        device: torch.device,
-    ) -> Optional[torch.Tensor]:
-        if voltages is None:
-            return None
-
-        if not torch.is_tensor(voltages):
-            voltage_tensor = torch.tensor(voltages, dtype=torch.float32, device=device)
-        else:
-            voltage_tensor = voltages.to(device=device, dtype=torch.float32)
-
-        if voltage_tensor.dim() == 1:
-            if voltage_tensor.numel() != self.total_mzis:
-                raise ValueError(
-                    f"Expected {self.total_mzis} voltages, got {voltage_tensor.numel()}."
-                )
-            return voltage_tensor.unsqueeze(0).expand(batch_size, -1)
-
-        if voltage_tensor.dim() == 2:
-            if voltage_tensor.size(1) != self.total_mzis:
-                raise ValueError(
-                    f"Expected voltage vectors of length {self.total_mzis}, "
-                    f"got {voltage_tensor.size(1)}."
-                )
-            if voltage_tensor.size(0) == batch_size:
-                return voltage_tensor
-            if voltage_tensor.size(0) == 1:
-                return voltage_tensor.expand(batch_size, -1)
-            raise ValueError(
-                f"Voltage batch dimension mismatch: expected {batch_size}, "
-                f"got {voltage_tensor.size(0)}."
-            )
-
-        raise ValueError("voltages must be None, 1D or 2D tensor.")
-
-    def _get_combined_matrix(self, device, voltages: Optional[torch.Tensor] = None):
+    def _get_combined_matrix(self, device):
         
         """
         Get combined transfer matrix with training-safe caching
@@ -144,10 +82,8 @@ class SingleChannelFilter(nn.Module):
         Returns:
             torch.Tensor: Combined transfer matrix of shape (matrix_size, matrix_size)
         """
-        if voltages is not None:
-            return self._build_combined_transfer_matrix(device, voltages=voltages)
-
         # TRAINING MODE: Always rebuild matrix to avoid gradient conflicts
+        
         if self.training:
             return self._build_combined_transfer_matrix(device)
 
@@ -162,9 +98,7 @@ class SingleChannelFilter(nn.Module):
 
         return self._combined_matrix
 
-    def _build_combined_transfer_matrix(
-        self, device, voltages: Optional[torch.Tensor] = None
-    ):
+    def _build_combined_transfer_matrix(self, device):
         """
         Build combined transfer matrix by multiplying all MZI layer matrices
 
@@ -177,25 +111,13 @@ class SingleChannelFilter(nn.Module):
         Returns:
             torch.Tensor: Combined transfer matrix
         """
-        if voltages is not None:
-            voltages = voltages.to(device=device)
-            if voltages.numel() != self.total_mzis:
-                raise ValueError(
-                    f"Expected {self.total_mzis} voltages, got {voltages.numel()}."
-                )
-
         # Start with identity matrix
         combined_matrix = torch.eye(self.matrix_size, dtype=torch.complex64, device=device)
 
         # Multiply matrices in reverse order (right to left multiplication)
         # This ensures proper composition: output = M_n * M_{n-1} * ... * M_1 * input
         for layer in reversed(self.layers):
-            layer_voltage = None
-            if voltages is not None and hasattr(layer, "mzi_indices"):
-                layer_voltage = voltages[layer.mzi_indices]
-            layer_matrix = layer._build_transfer_matrix(
-                device, voltage_overrides=layer_voltage
-            )
+            layer_matrix = layer._build_transfer_matrix(device)
             combined_matrix = torch.matmul(layer_matrix, combined_matrix)
 
         return combined_matrix
@@ -334,12 +256,7 @@ class SingleChannelFilter(nn.Module):
             self._combined_matrix = None  # Clear cached matrix
         return self
 
-    def forward(
-        self,
-        x,
-        voltages: Optional[torch.Tensor] = None,
-        return_intermediate=False,
-    ):
+    def forward(self, x, return_intermediate=False):
         """
         Forward propagation function using combined transfer matrix
 
@@ -349,9 +266,6 @@ class SingleChannelFilter(nn.Module):
 
         Args:
             x (Tensor): Input tensor of shape (batch_size, height, width)
-            voltages (Tensor or sequence, optional): Heater voltages provided as a
-                1D tensor (shared across the batch) or 2D tensor with shape
-                (batch_size, total_mzis).
             return_intermediate (bool): Whether to return intermediate values for the first patch
 
         Returns:
@@ -385,57 +299,21 @@ class SingleChannelFilter(nn.Module):
         # Convert to complex type for MZI processing
         patches = patches.to(torch.complex64)
 
-        # Resolve per-batch voltages
-        voltage_batch = self._prepare_voltages(voltages, batch_size, patches.device)
+        # Get combined transfer matrix
+        combined_matrix = self._get_combined_matrix(patches.device)
 
         # Process through MZI array based on detection mode
         if self.detection_mode == 'coherent':
-            if voltage_batch is None:
-                combined_matrix = self._get_combined_matrix(patches.device)
-                output_patches, processed_patch = self._coherent_forward(
-                    patches, combined_matrix, return_intermediate
-                )
-            else:
-                outputs = []
-                processed_patch = None
-                for sample_idx in range(batch_size):
-                    combined_matrix = self._build_combined_transfer_matrix(
-                        patches.device, voltages=voltage_batch[sample_idx]
-                    )
-                    sample_output, sample_processed = self._coherent_forward(
-                        patches[sample_idx : sample_idx + 1],
-                        combined_matrix,
-                        return_intermediate,
-                    )
-                    outputs.append(sample_output)
-                    if return_intermediate and processed_patch is None:
-                        processed_patch = sample_processed
-                output_patches = torch.cat(outputs, dim=0)
+            output_patches, processed_patch = self._coherent_forward(
+                patches, combined_matrix, return_intermediate
+            )
             # Apply trainable diagonal weights to complex amplitudes
             weighted_output = output_patches * self.diagonal_matrix.view(1, 1, -1)
 
         else:  # 'power'
-            if voltage_batch is None:
-                combined_matrix = self._get_combined_matrix(patches.device)
-                output_powers, processed_patch = self._power_forward(
-                    patches, combined_matrix, return_intermediate
-                )
-            else:
-                outputs = []
-                processed_patch = None
-                for sample_idx in range(batch_size):
-                    combined_matrix = self._build_combined_transfer_matrix(
-                        patches.device, voltages=voltage_batch[sample_idx]
-                    )
-                    sample_output, sample_processed = self._power_forward(
-                        patches[sample_idx : sample_idx + 1],
-                        combined_matrix,
-                        return_intermediate,
-                    )
-                    outputs.append(sample_output)
-                    if return_intermediate and processed_patch is None:
-                        processed_patch = sample_processed
-                output_powers = torch.cat(outputs, dim=0)
+            output_powers, processed_patch = self._power_forward(
+                patches, combined_matrix, return_intermediate
+            )
             # Apply trainable diagonal weights to powers
             # For power domain: weight^2 is applied to power values
             weighted_output = output_powers * (self.diagonal_matrix.abs() ** 2).view(1, 1, -1)

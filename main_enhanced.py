@@ -1,3 +1,5 @@
+from typing import Optional
+
 import torch
 import torch.cuda
 from torch.utils.data import DataLoader
@@ -71,7 +73,13 @@ def collect_and_save_filter_data_enhanced(model, dataloader, device, save_dir="f
                     mzi_array_io_waveguide_desc.append(f"Waveguide {i}: Padding")
             current_filter_data['mzi_array_io_waveguide_description'] = mzi_array_io_waveguide_desc
 
-            raw_thetas_with_position = []
+            mzi_params_with_position = []
+
+            def _safe_grad(param: torch.Tensor) -> Optional[float]:
+                if param.grad is None:
+                    return None
+                return float(param.grad.detach().cpu().item())
+
             for scf_layer_idx, mzi_array_layer_instance in enumerate(module.layers):
                 mzi_array_type = 'unknown_mzi_array_layer'
                 num_mzis_in_this_mzi_array_layer = 0
@@ -85,8 +93,16 @@ def collect_and_save_filter_data_enhanced(model, dataloader, device, save_dir="f
                         mzi_array_type = 'MZIlayer_column'
 
                     for mzi_idx_in_array, mzi_instance in enumerate(mzi_array_layer_instance.MZI):
-                        theta_value = mzi_instance.raw_sin_theta.detach().cpu().numpy().item()
-                        theta_grad = mzi_instance.raw_sin_theta.grad.detach().cpu().numpy().item() if mzi_instance.raw_sin_theta.grad is not None else None
+                        physical_params = {
+                            name: float(tensor.detach().cpu().item())
+                            for name, tensor in mzi_instance.physical_parameters().items()
+                        }
+                        raw_gradients = {
+                            'raw_a': _safe_grad(mzi_instance._raw_a),
+                            'raw_b': _safe_grad(mzi_instance._raw_b),
+                            'raw_delta_r': _safe_grad(mzi_instance._raw_delta_r),
+                            'raw_phi0': _safe_grad(mzi_instance._raw_phi0),
+                        }
 
                         acting_on_waveguides_desc = "N/A"
                         if mzi_array_type == 'MZIlayer_row':
@@ -105,15 +121,15 @@ def collect_and_save_filter_data_enhanced(model, dataloader, device, save_dir="f
                             'total_mzis_in_this_mzi_array_layer': num_mzis_in_this_mzi_array_layer,
                             'mzi_acting_on_waveguides_description': acting_on_waveguides_desc
                         }
-                        raw_thetas_with_position.append({
-                            'value': theta_value,
-                            'gradient': theta_grad,
+                        mzi_params_with_position.append({
+                            'values': physical_params,
+                            'raw_parameter_gradients': raw_gradients,
                             'position': position_info
                         })
                 else:
                     print(f"Warning: Encountered unexpected layer type or structure in SingleChannelFilter.layers[{scf_layer_idx}]")
 
-            current_filter_data['raw_sin_thetas_with_position'] = raw_thetas_with_position
+            current_filter_data['mzi_parameters_with_position'] = mzi_params_with_position
             collected_filter_internals[key] = current_filter_data
 
         return hook

@@ -11,7 +11,7 @@ from module.channel import SingleChannelFilter
 def load_parameters_from_csv(model, csv_path):
     """
     Loads MZI parameters from a CSV file into the model.
-    This corrected version reads the 'raw_sin_theta' column directly.
+    The file must contain the physical parameters defined in AGENTS.md.
     """
     try:
         df = pd.read_csv(csv_path)
@@ -19,22 +19,35 @@ def load_parameters_from_csv(model, csv_path):
         print(f"Error: Cannot find filter CSV file at {csv_path}")
         return False
 
-    if 'raw_sin_theta' not in df.columns:
-        print(f"Error: CSV file {csv_path} is missing the required 'raw_sin_theta' column.")
+    required_cols = {"mzi_array_layer_in_filter", "mzi_index_in_layer", "a", "b", "phi0"}
+    if not required_cols.issubset(df.columns):
+        missing = required_cols - set(df.columns)
+        print(
+            f"Error: CSV file {csv_path} is missing required columns {missing}."
+        )
         return False
 
-    df_sorted = df.sort_values(by=['mzi_array_layer_in_filter', 'mzi_index_in_layer']).reset_index()
+    df_sorted = df.sort_values(
+        by=['mzi_array_layer_in_filter', 'mzi_index_in_layer']
+    ).reset_index(drop=True)
 
-    mzi_params = [p for layer in model.layers for mzi in layer.MZI for p in mzi.parameters()]
-    if len(df_sorted) != len(mzi_params):
-        print(f"[Warning] Mismatch for {os.path.basename(csv_path)}: CSV has {len(df_sorted)} params, model has {len(mzi_params)}. Skipping file.")
+    mzis = [mzi for layer in model.layers for mzi in layer.MZI]
+    if len(df_sorted) != len(mzis):
+        print(
+            f"[Warning] Mismatch for {os.path.basename(csv_path)}: CSV has "
+            f"{len(df_sorted)} entries, model has {len(mzis)} MZIs. Skipping file."
+        )
         return False
 
     with torch.no_grad():
-        for idx, row in df_sorted.iterrows():
-            raw_sin_theta_val = row['raw_sin_theta']
-            mzi_params[idx].fill_(raw_sin_theta_val)
-            
+        for mzi, (_, row) in zip(mzis, df_sorted.iterrows()):
+            mzi.load_physical_parameters(
+                a=row['a'],
+                b=row['b'],
+                delta_r=row.get('delta_r', 0.0),
+                phi0=row['phi0'],
+            )
+
     with torch.no_grad():
         model.diagonal_matrix.fill_(1.0)
 
