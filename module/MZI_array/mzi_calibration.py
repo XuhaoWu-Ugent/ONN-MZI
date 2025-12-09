@@ -14,15 +14,11 @@ def _exp_neg_j(phi: torch.Tensor) -> torch.Tensor:
 
 class MZI(nn.Module):
     """
-    Four-port Mach–Zehnder interferometer for CNN training with calibrated hardware.
+    Four-port Mach–Zehnder interferometer that preserves complex fields.
 
-    This version is designed for CNN training where:
-    - Hardware fabrication parameters (a, b, delta_r, phi0) are FIXED after loading
-      from calibration results (mzi_parameters.json)
-    - Voltage is a TRAINABLE parameter that controls the phase shift to implement
-      the desired CNN weights
-
-    The parameterisation follows the definitions in AGENTS.md.
+    The parameterisation follows the definitions in AGENTS.md. All fabrication
+    variations (coupling ratios, intrinsic phase, heater resistance error) remain
+    trainable, while the heater voltage is supplied at runtime.
     """
 
     def __init__(
@@ -32,8 +28,6 @@ class MZI(nn.Module):
         nominal_resistance: float = 1200.0,
         p_pi: float = 12e-3,
         epsilon: float = 1e-8,
-        trainable_fabrication: bool = False,
-        trainable_voltage: bool = True,
     ) -> None:
         super().__init__()
 
@@ -46,29 +40,15 @@ class MZI(nn.Module):
             "alpha_amplitude", torch.tensor(math.sqrt(0.94), dtype=torch.float32)
         )
         self.device = torch.device("cuda") if torch.cuda.is_available() else "cpu"
-
-        # Hardware fabrication parameters (should be loaded from calibration and frozen)
-        # These represent the physical imperfections of the manufactured MZI
-        self._raw_a = nn.Parameter(torch.zeros(1), requires_grad=trainable_fabrication)
-        self._raw_b = nn.Parameter(torch.zeros(1), requires_grad=trainable_fabrication)
-        self._raw_delta_r = nn.Parameter(torch.zeros(1), requires_grad=trainable_fabrication)
-        self._raw_phi0 = nn.Parameter(torch.zeros(1), requires_grad=trainable_fabrication)
-
-        # Voltage parameter (trainable - this is what we control to implement CNN weights)
-        # Initialize with small random values to break symmetry
-        self._voltage = nn.Parameter(
-            torch.randn(1) * 0.1, requires_grad=trainable_voltage
-        )
-
+        # Trainable fabrication parameters.
+        self._raw_a = nn.Parameter(torch.zeros(1))
+        self._raw_b = nn.Parameter(torch.zeros(1))
+        self._raw_delta_r = nn.Parameter(torch.zeros(1))
+        self._raw_phi0 = nn.Parameter(torch.zeros(1))
         self.matrix = torch.zeros((4, 4), dtype=torch.complex64, device=self.device)
-
+        
     def extra_repr(self) -> str:
-        parts = []
-        if self.index is not None:
-            parts.append(f"index={self.index}")
-        parts.append(f"trainable_voltage={self._voltage.requires_grad}")
-        parts.append(f"trainable_fabrication={self._raw_a.requires_grad}")
-        return ", ".join(parts)
+        return f"index={self.index}" if self.index is not None else ""
 
     # ------------------------------------------------------------------
     # Parameter mappings
@@ -117,11 +97,9 @@ class MZI(nn.Module):
         phi0: Optional[Union[float, torch.Tensor]] = None,
     ) -> None:
         """
-        Overwrite the internal fabrication parameters with calibrated physical values.
+        Overwrite the internal trainable parameters with physical values.
 
         The provided values must respect the valid ranges described in AGENTS.md.
-        After loading, you should call freeze_fabrication_parameters() to prevent
-        these from being trained.
         """
         dtype = self._raw_a.dtype
         device = self._raw_a.device
@@ -131,15 +109,12 @@ class MZI(nn.Module):
             if a is not None:
                 a_tensor = torch.as_tensor(a, dtype=dtype, device=device)
                 a_tensor = torch.clamp(a_tensor, 0.45, 0.55)
-                # Inverse of sigmoid mapping: raw = logit((a - 0.45) / 0.1)
-                normalized = (a_tensor - 0.45) / 0.1
-                self._raw_a.copy_(torch.logit(normalized))
+                self._raw_a.copy_(torch.logit(a_tensor))
 
             if b is not None:
                 b_tensor = torch.as_tensor(b, dtype=dtype, device=device)
                 b_tensor = torch.clamp(b_tensor, 0.45, 0.55)
-                normalized = (b_tensor - 0.45) / 0.1
-                self._raw_b.copy_(torch.logit(normalized))
+                self._raw_b.copy_(torch.logit(b_tensor))
 
             if delta_r is not None:
                 delta_tensor = torch.as_tensor(delta_r, dtype=dtype, device=device)
@@ -151,50 +126,12 @@ class MZI(nn.Module):
                 ratio = torch.clamp(phi_tensor / math.pi, -1.0 + eps, 1.0 - eps)
                 self._raw_phi0.copy_(torch.atanh(ratio))
 
-    def freeze_fabrication_parameters(self) -> None:
-        """
-        Freeze the hardware fabrication parameters so they won't be updated during training.
-        Call this after loading calibrated parameters from JSON.
-        """
-        self._raw_a.requires_grad = False
-        self._raw_b.requires_grad = False
-        self._raw_delta_r.requires_grad = False
-        self._raw_phi0.requires_grad = False
-
-    def unfreeze_fabrication_parameters(self) -> None:
-        """
-        Unfreeze the hardware fabrication parameters (only for calibration training).
-        """
-        self._raw_a.requires_grad = True
-        self._raw_b.requires_grad = True
-        self._raw_delta_r.requires_grad = True
-        self._raw_phi0.requires_grad = True
-
-    def get_voltage(self) -> torch.Tensor:
-        """
-        Get the current voltage parameter value.
-        """
-        return self._voltage
-
-    def set_voltage(self, voltage: Union[float, torch.Tensor]) -> None:
-        """
-        Set the voltage parameter to a specific value.
-        """
-        with torch.no_grad():
-            if not torch.is_tensor(voltage):
-                voltage = torch.tensor(voltage, dtype=self._voltage.dtype)
-            self._voltage.copy_(voltage.to(self._voltage.device))
-
     def transfer_matrix(
         self, voltage: Optional[Union[float, torch.Tensor]] = None
     ) -> torch.Tensor:
 
         """
         Compute the 4×4 scattering matrix defined in AGENTS.md.
-
-        Args:
-            voltage: Optional external voltage override. If None, uses the internal
-                    trainable _voltage parameter.
         """
 
         params = self.physical_parameters()
@@ -207,15 +144,14 @@ class MZI(nn.Module):
         dtype = a.dtype
         device = a.device
 
-        # Use internal trainable voltage if no external voltage is provided
         if voltage is None:
-            voltage_tensor = self._voltage.to(dtype=dtype, device=device).view(1)
+            voltage_tensor = torch.zeros(1, dtype=dtype, device=device)
         else:
             if not torch.is_tensor(voltage):
                 voltage_tensor = torch.tensor(voltage, dtype=dtype, device=device)
             else:
                 voltage_tensor = voltage.to(device=device, dtype=dtype)
-            voltage_tensor = voltage_tensor.view(1)
+        voltage_tensor = voltage_tensor.view(1)
 
         resistance = torch.clamp(
             torch.tensor(self.nominal_resistance, dtype=dtype, device=device) + delta_r,
@@ -255,7 +191,7 @@ class MZI(nn.Module):
             torch.stack([S31, S32, zero, zero]),
             torch.stack([S41, S42, zero, zero])
         ]).squeeze(-1)
-
+        
         return matrix
 
     def forward(
@@ -265,11 +201,6 @@ class MZI(nn.Module):
     ) -> torch.Tensor:
         """
         Propagate complex optical fields through the MZI.
-
-        Args:
-            field: Input optical field
-            voltage: Optional external voltage override. If None, uses the internal
-                    trainable _voltage parameter.
         """
         if not field.dtype.is_complex:
             field = field.to(torch.complex64)
@@ -289,7 +220,6 @@ class MZI(nn.Module):
                 self._raw_b,
                 self._raw_delta_r,
                 self._raw_phi0,
-                self._voltage,
             )
         )
 

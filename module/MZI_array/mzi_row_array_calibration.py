@@ -8,11 +8,10 @@ from .mzi import MZI
 
 class MZIlayer_row(nn.Module):
     """
-    Horizontal array of Mach–Zehnder interferometers for CNN training.
+    Horizontal array of Mach–Zehnder interferometers preserving complex fields.
 
-    This version uses MZIs with calibrated hardware parameters (fixed) and
-    trainable internal voltage parameters. When no external voltage is provided,
-    each MZI uses its own trainable _voltage parameter.
+    The implementation mirrors the original transfer-matrix based model from
+    ``module_backup`` with the updated MZI physics.
     """
 
     def __init__(
@@ -31,7 +30,7 @@ class MZIlayer_row(nn.Module):
         self.num = num
         self.num_ports = num * 2
         self.matrix_size = 2 * self.num_ports
-
+        
 
         self.mzi_indices: List[int] = [start_index + i for i in range(num)]
         self.MZI = nn.ModuleList(
@@ -116,8 +115,7 @@ class MZIlayer_row(nn.Module):
         Args:
             device: Target device for the matrix.
             voltage_overrides: Optional tensor of shape (num,) supplying explicit
-                               voltages for each MZI in this layer. If None, each
-                               MZI will use its internal trainable _voltage parameter.
+                               voltages for each MZI in this layer.
         """
         use_cache = (
             not self.training
@@ -129,11 +127,13 @@ class MZIlayer_row(nn.Module):
         if use_cache:
             return self._cached_matrix
 
-
-        # Prepare voltage vector if overrides are provided
-        voltage_vector = None
-        if voltage_overrides is not None:
-            param_dtype = self.MZI[0]._raw_a.dtype if self.MZI else torch.float32
+        
+        param_dtype = self.MZI[0]._raw_a.dtype if self.MZI else torch.float32
+        if voltage_overrides is None:
+            voltage_vector = torch.zeros(
+                self.num, dtype=param_dtype, device=device
+            )
+        else:
             voltage_vector = voltage_overrides.to(
                 device=device, dtype=param_dtype
             ).view(-1)
@@ -154,10 +154,7 @@ class MZIlayer_row(nn.Module):
         all_values = []
 
         for idx, mzi in enumerate(self.MZI):
-            # If voltage_vector is None, transfer_matrix will use the internal trainable _voltage
-            # If voltage_vector is provided, use the specific voltage for this MZI
-            mzi_voltage = voltage_vector[idx] if voltage_vector is not None else None
-            s_matrix = mzi.transfer_matrix(voltage=mzi_voltage).to(device=device)
+            s_matrix = mzi.transfer_matrix(voltage=voltage_vector[idx]).to(device=device)
             upper = 2 * idx
             lower = upper + 1
             indices_pairs = [
@@ -166,25 +163,25 @@ class MZIlayer_row(nn.Module):
                 (self.num_ports + upper, lower, s_matrix[2, 1]),
                 (self.num_ports + lower, upper, s_matrix[3, 0]),
                 (self.num_ports + lower, lower, s_matrix[3, 1]),
-
+                
                 (upper, self.num_ports + upper, s_matrix[0, 2]),
                 (upper, self.num_ports + lower, s_matrix[0, 3]),
                 (lower, self.num_ports + upper, s_matrix[1, 2]),
                 (lower, self.num_ports + lower, s_matrix[1, 3]),
-
+                
 
                 (upper, upper, s_matrix[0, 0]),
                 (upper, lower, s_matrix[0, 1]),
                 (lower, upper, s_matrix[1, 0]),
                 (lower, lower, s_matrix[1, 1]),
-
+                
 
                 (self.num_ports + upper, self.num_ports + upper, s_matrix[2, 2]),
                 (self.num_ports + upper, self.num_ports + lower, s_matrix[2, 3]),
                 (self.num_ports + lower, self.num_ports + upper, s_matrix[3, 2]),
                 (self.num_ports + lower, self.num_ports + lower, s_matrix[3, 3]),
             ]
-
+            
             for i, j, val in indices_pairs:
                 all_indices_i.append(i)
                 all_indices_j.append(j)
@@ -194,7 +191,7 @@ class MZIlayer_row(nn.Module):
             indices_i = torch.tensor(all_indices_i, dtype=torch.long, device=device)
             indices_j = torch.tensor(all_indices_j, dtype=torch.long, device=device)
             values = torch.stack(all_values)
-
+            
             matrix = matrix.index_put(
                 (indices_i, indices_j),
                 values,
@@ -222,8 +219,8 @@ class MZIlayer_row(nn.Module):
         Args:
             input_tensor: Tensor with shape (batch, ports) or
                           (batch, patches, ports).
-            voltages: Optional per-MZI voltage overrides. If None, each MZI
-                     uses its internal trainable _voltage parameter.
+            voltages: Optional per-MZI voltage overrides aligned with the full
+                      array indexing used during calibration.
         """
         if input_tensor.dim() == 2:
             input_tensor = input_tensor.unsqueeze(1)

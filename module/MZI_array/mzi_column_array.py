@@ -8,7 +8,11 @@ from .mzi import MZI
 
 class MZIlayer_column(nn.Module):
     """
-    Vertical array of Mach–Zehnder interferometers with fixed bypass ports.
+    Vertical array of Mach–Zehnder interferometers for CNN training.
+
+    This version uses MZIs with calibrated hardware parameters (fixed) and
+    trainable internal voltage parameters. When no external voltage is provided,
+    each MZI uses its own trainable _voltage parameter.
     """
 
     def __init__(
@@ -104,6 +108,15 @@ class MZIlayer_column(nn.Module):
         device: torch.device,
         voltage_overrides: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """
+        Build the 2N×2N scattering matrix for the entire column.
+
+        Args:
+            device: Target device for the matrix.
+            voltage_overrides: Optional tensor of shape (num,) supplying explicit
+                               voltages for each MZI in this layer. If None, each
+                               MZI will use its internal trainable _voltage parameter.
+        """
         use_cache = ( voltage_overrides is None
             and self._cached_matrix is not None
             and self._cached_signature == self._parameter_signature()
@@ -111,18 +124,16 @@ class MZIlayer_column(nn.Module):
         if use_cache:
             return self._cached_matrix
 
-        matrix=torch.zeros(
+        matrix = torch.zeros(
             (self.matrix_size, self.matrix_size),
             dtype=torch.complex64,
-            device=torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"),
+            device=device,
         )
 
-        param_dtype = self.MZI[0]._raw_a.dtype if self.MZI else torch.float32
-        if voltage_overrides is None:
-            voltage_vector = torch.zeros(
-                self.num, dtype=param_dtype, device=device
-            )
-        else:
+        # Prepare voltage vector if overrides are provided
+        voltage_vector = None
+        if voltage_overrides is not None:
+            param_dtype = self.MZI[0]._raw_a.dtype if self.MZI else torch.float32
             voltage_vector = voltage_overrides.to(
                 device=device, dtype=param_dtype
             ).view(-1)
@@ -138,7 +149,10 @@ class MZIlayer_column(nn.Module):
         matrix[self.num_ports - 1, self.num_ports + (self.num_ports - 1)] = 1.0
 
         for idx, mzi in enumerate(self.MZI):
-            s_matrix = mzi.transfer_matrix(voltage=voltage_vector[idx]).to(
+            # If voltage_vector is None, transfer_matrix will use the internal trainable _voltage
+            # If voltage_vector is provided, use the specific voltage for this MZI
+            mzi_voltage = voltage_vector[idx] if voltage_vector is not None else None
+            s_matrix = mzi.transfer_matrix(voltage=mzi_voltage).to(
                 device=device
             )
 
@@ -180,6 +194,15 @@ class MZIlayer_column(nn.Module):
         input_tensor: torch.Tensor,
         voltages: Optional[Union[torch.Tensor, Sequence[float]]] = None,
     ) -> torch.Tensor:
+        """
+        Propagate complex amplitudes through the column array.
+
+        Args:
+            input_tensor: Tensor with shape (batch, ports) or
+                          (batch, patches, ports).
+            voltages: Optional per-MZI voltage overrides. If None, each MZI
+                     uses its internal trainable _voltage parameter.
+        """
         if input_tensor.dim() == 2:
             input_tensor = input_tensor.unsqueeze(1)
             squeeze_output = True
@@ -242,6 +265,7 @@ class MZIlayer_column(nn.Module):
         return output
 
     def get_all_time(self) -> dict:
+        """Compatibility helper mirroring the legacy API."""
         total_stats = {"allocation": 0.0, "computation": 0.0, "total": 0.0}
         for mzi in self.MZI:
             if hasattr(mzi, "get_all_time"):

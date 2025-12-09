@@ -26,9 +26,9 @@ def get_args():
                             help='Input image size')
     arch_group.add_argument('--input-channels', type=int, default=1,
                             help='Number of input channels (1 for grayscale)')
-    arch_group.add_argument('--hidden-channels', type=int, default=4,
+    arch_group.add_argument('--hidden-channels', type=int, default=12,
                             help='Number of channels in all layers')
-    arch_group.add_argument('--num-layers', type=int, default=4,
+    arch_group.add_argument('--num-layers', type=int, default=1,
                             help='Number of CNN layers')
     arch_group.add_argument('--kernel-size', type=int, default=3,
                             help='Convolution kernel size')
@@ -62,7 +62,7 @@ def get_args():
                             help='Training batch size')
     train_group.add_argument('--test-batch-size', type=int, default=200,
                             help='Testing batch size')
-    train_group.add_argument('--epochs', type=int, default=5,
+    train_group.add_argument('--epochs', type=int, default=7,
                             help='Number of training epochs')
     train_group.add_argument('--lr', type=float, default=0.01,
                             help='Learning rate')
@@ -84,6 +84,19 @@ def get_args():
                              help='Save the trained model')
     output_group.add_argument('--wandb', action='store_true', default=False,
                              help='Enable Weights & Biases logging')
+
+    # Chaotic Noise Parameters
+    chaos_group = parser.add_argument_group('Chaotic Noise Configuration')
+    chaos_group.add_argument('--chaotic-noise', action='store_true', default=False,
+                            help='Enable chaotic noise injection from external signal')
+    chaos_group.add_argument('--chaotic-noise-scale', type=float, default=1.0,
+                            help='Scaling factor for chaotic noise')
+    chaos_group.add_argument('--chaotic-data-path', type=str, 
+                            default='Chaotic_feedback_OSC/TimeSeriesSignal.csv',
+                            help='Path to the chaotic signal CSV file')
+    chaos_group.add_argument('--chaotic-mode', type=str, default='replace',
+                            choices=['replace', 'add'],
+                            help="Mode of noise injection: 'replace' (source = noise) or 'add' (source = 1 + noise)")
 
     args = parser.parse_args()
 
