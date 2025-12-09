@@ -71,6 +71,14 @@ class MZIlayer_column(nn.Module):
         dtype: torch.dtype,
         device: torch.device,
     ) -> Optional[torch.Tensor]:
+        """
+        Resolve voltage inputs into a standardized format.
+
+        Returns:
+            None if voltages should use internal parameters (shared across batch)
+            1D tensor (num,) if all samples share the same voltage (shared mode)
+            2D tensor (batch, num) if each sample has different voltages (batched mode)
+        """
         if voltages is None:
             return None
 
@@ -82,15 +90,17 @@ class MZIlayer_column(nn.Module):
         if voltage_tensor.dim() == 1:
             # Case 1: Compact voltage vector (length == num MZIs in this layer)
             if voltage_tensor.numel() == self.num:
-                return voltage_tensor.unsqueeze(0).expand(batch_size, -1)
-                
+                # Return 1D - indicates shared voltage across all samples
+                return voltage_tensor
+
             # Case 2: Global voltage vector (must cover the max index)
             if voltage_tensor.numel() < max(self.mzi_indices) + 1:
                 raise ValueError(
                     f"Voltage vector too short. Expected length {self.num} (compact) or >= {max(self.mzi_indices) + 1} (global), got {voltage_tensor.numel()}."
                 )
             selected = voltage_tensor[self.mzi_indices]
-            return selected.unsqueeze(0).expand(batch_size, -1)
+            # Return 1D - indicates shared voltage across all samples
+            return selected
 
         if voltage_tensor.dim() == 2:
             # Case 1: Compact voltage matrix (cols == num MZIs)
@@ -98,7 +108,8 @@ class MZIlayer_column(nn.Module):
                  if voltage_tensor.size(0) == batch_size:
                     return voltage_tensor
                  if voltage_tensor.size(0) == 1:
-                    return voltage_tensor.expand(batch_size, -1)
+                    # Single row - same voltage for all samples, return 1D
+                    return voltage_tensor.squeeze(0)
                  raise ValueError(f"Voltage batch size mismatch. Expected {batch_size}, got {voltage_tensor.size(0)}.")
 
             # Case 2: Global voltage matrix
@@ -109,7 +120,8 @@ class MZIlayer_column(nn.Module):
             if voltage_tensor.size(0) == batch_size:
                 return voltage_tensor[:, self.mzi_indices]
             if voltage_tensor.size(0) == 1:
-                return voltage_tensor[:, self.mzi_indices].expand(batch_size, -1)
+                # Single row - same voltage for all samples, return 1D
+                return voltage_tensor[:, self.mzi_indices].squeeze(0)
             raise ValueError("Voltage batch dimension mismatch.")
 
         raise ValueError("Voltages must be a 1D or 2D tensor.")
@@ -145,29 +157,32 @@ class MZIlayer_column(nn.Module):
         if use_cache:
             return self._cached_matrix
 
-        # Determine if batched
-        is_batched = voltage_overrides is not None and voltage_overrides.dim() == 2
-        batch_size = voltage_overrides.size(0) if is_batched else 1
-
         # Prepare voltage tensor
         voltage_tensor = None
+        is_batched = False
+
         if voltage_overrides is not None:
             param_dtype = self.MZI[0]._raw_a.dtype if self.MZI else torch.float32
             voltage_tensor = voltage_overrides.to(device=device, dtype=param_dtype)
 
             if voltage_tensor.dim() == 1:
+                # 1D voltage - shared across all samples, non-batched mode
                 if voltage_tensor.numel() != self.num:
                     raise ValueError(
                         f"Expected {self.num} voltages, got {voltage_tensor.numel()}."
                     )
-                voltage_tensor = voltage_tensor.unsqueeze(0)  # (1, num)
+                is_batched = False
             elif voltage_tensor.dim() == 2:
+                # 2D voltage - different for each sample, batched mode
                 if voltage_tensor.size(1) != self.num:
                     raise ValueError(
                         f"Expected {self.num} voltages per sample, got {voltage_tensor.size(1)}."
                     )
+                is_batched = True
             else:
                 raise ValueError("voltage_overrides must be 1D or 2D tensor.")
+
+        batch_size = voltage_tensor.size(0) if is_batched else 1
 
         # Initialize matrix
         if is_batched:
@@ -199,12 +214,20 @@ class MZIlayer_column(nn.Module):
         for idx, mzi in enumerate(self.MZI):
             # Get voltage for this MZI
             if voltage_tensor is not None:
-                mzi_voltage = voltage_tensor[:, idx]  # (Batch,) or (1,)
+                if is_batched:
+                    mzi_voltage = voltage_tensor[:, idx]  # (Batch,)
+                else:
+                    mzi_voltage = voltage_tensor[idx]  # scalar
             else:
                 mzi_voltage = None
 
-            # Get transfer matrix: (4, 4) or (Batch, 4, 4)
+            # Get transfer matrix: (4, 4) or (Batch, 4, 4) or (1, 4, 4)
             s_matrix = mzi.transfer_matrix(voltage=mzi_voltage).to(device=device)
+
+            # Ensure s_matrix has correct shape
+            if not is_batched and s_matrix.dim() == 3 and s_matrix.size(0) == 1:
+                # Squeeze out batch dimension if it's 1 in non-batched mode
+                s_matrix = s_matrix.squeeze(0)
 
             upper = 2 * idx + 1
             lower = upper + 1
@@ -230,12 +253,14 @@ class MZIlayer_column(nn.Module):
             ]
 
             # Assign values
-            if s_matrix.dim() == 2:  # Non-batched (4, 4)
-                for i, j, si, sj in indices_mapping:
-                    matrix[i, j] = s_matrix[si, sj]
-            else:  # Batched (Batch, 4, 4)
+            if is_batched:
+                # Batched mode: matrix is (Batch, M, M), s_matrix is (Batch, 4, 4)
                 for i, j, si, sj in indices_mapping:
                     matrix[:, i, j] = s_matrix[:, si, sj]
+            else:
+                # Non-batched mode: matrix is (M, M), s_matrix is (4, 4)
+                for i, j, si, sj in indices_mapping:
+                    matrix[i, j] = s_matrix[si, sj]
 
         # Cache if applicable
         if voltage_overrides is None and not self.training:
@@ -282,16 +307,17 @@ class MZIlayer_column(nn.Module):
         device = input_tensor.device
         dtype = input_tensor.real.dtype
 
-        voltage_matrix = self._resolve_voltages(
+        voltage_resolved = self._resolve_voltages(
             voltages, batch_size, dtype=dtype, device=device
         )
 
         input_flat = input_tensor.reshape(-1, num_ports)
         batch_total = input_flat.shape[0]
 
-        if voltage_matrix is None:
-            # No voltage override: use single cached transfer matrix
-            transfer = self._build_transfer_matrix(device)
+        if voltage_resolved is None or voltage_resolved.dim() == 1:
+            # Shared voltage mode: all samples use the same transfer matrix
+            # voltage_resolved is None (use internal params) or 1D (shared external voltage)
+            transfer = self._build_transfer_matrix(device, voltage_overrides=voltage_resolved)
 
             state_vectors = torch.zeros(
                 batch_total, self.matrix_size, dtype=torch.complex64, device=device
@@ -301,8 +327,9 @@ class MZIlayer_column(nn.Module):
             new_states = torch.matmul(state_vectors, transfer.T)
             output_flat = new_states[:, self.num_ports : self.num_ports + num_ports]
         else:
-            # Voltage override: build batched transfer matrices
-            voltage_flat = voltage_matrix.unsqueeze(1).repeat(1, num_patches, 1)
+            # Batched voltage mode: each sample has different voltage
+            # voltage_resolved is 2D (batch, num)
+            voltage_flat = voltage_resolved.unsqueeze(1).repeat(1, num_patches, 1)
             voltage_flat = voltage_flat.reshape(batch_total, self.num)
 
             # Build batched transfer matrices (Batch_Total, matrix_size, matrix_size)
