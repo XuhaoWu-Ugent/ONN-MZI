@@ -504,6 +504,91 @@ def main():
     print(f"  Total cache hits: {final_cache_stats['total_hits']:,}")
     print(f"  Total cache misses: {final_cache_stats['total_misses']:,}")
     print(f"  Final cache hit rate: {final_cache_stats['hit_rate']:.3f}")
+    
+    # ---------------------------------------------------------
+    # Collect Hardware Verification Data
+    # ---------------------------------------------------------
+    print("\nStarting hardware data collection...")
+    collect_hardware_data(model, test_loader, device)
+
+def collect_hardware_data(model, dataloader, device, save_dir="hardware_data"):
+    import os
+    import numpy as np
+    
+    os.makedirs(save_dir, exist_ok=True)
+    model.eval()
+    
+    # Storage for collected data
+    # Structure: List of dicts, where each dict is one 'pass' through the optical core
+    collected_records = []
+    
+    # Define the hook function
+    def core_hook(module, input_args, output):
+        # input_args is (x, voltages)
+        # x: (Batch, 10)
+        # voltages: (Batch, 50) or (50,)
+        # output: (Batch, 10)
+        
+        x_in = input_args[0].detach().cpu().numpy()
+        voltages = input_args[1].detach().cpu().numpy()
+        output_out = output.detach().cpu().numpy()
+        
+        # If voltages is 1D (shared across batch), repeat it for consistency if needed
+        # Or just store it as is. Let's store as is to save space if it's constant.
+        
+        record = {
+            "input_optical_state": x_in,     # (Batch, 10)
+            "mzi_voltages": voltages,        # (Batch, 50) or (50,)
+            "output_optical_state": output_out # (Batch, 10)
+        }
+        collected_records.append(record)
+
+    # Register hook on the optical core
+    # Access the core directly from the model
+    if hasattr(model, 'optical_core'):
+        handle = model.optical_core.register_forward_hook(core_hook)
+    else:
+        print("Error: Model does not have 'optical_core' attribute. Cannot collect data.")
+        return
+
+    print("Hook registered. Running inference on a single batch...")
+    
+    # Run inference on just one batch to avoid massive data files
+    try:
+        data_iter = iter(dataloader)
+        x_batch, _ = next(data_iter)
+        x_batch = x_batch.to(device)
+        
+        with torch.no_grad():
+            _ = model(x_batch)
+            
+    except StopIteration:
+        print("Error: Dataloader is empty.")
+    except Exception as e:
+        print(f"Error during collection inference: {e}")
+    finally:
+        handle.remove()
+        print("Hook removed.")
+
+    # Save to file
+    if collected_records:
+        save_path = os.path.join(save_dir, 'vit_hardware_verification.npy')
+        
+        # We also want to know which record corresponds to which logical layer.
+        # Since the execution order is deterministic (FC1 block 0,0 -> 0,1... -> FC2...), 
+        # we can reconstruct the mapping if we know the architecture.
+        # For now, we save the raw sequence of operations.
+        
+        data_to_save = {
+            "records": collected_records,
+            "description": "Sequential records of every call to OpticalCore10x10.forward(x, v)."
+        }
+        
+        np.save(save_path, data_to_save)
+        print(f"Collected {len(collected_records)} hardware passes.")
+        print(f"Data saved to: {save_path}")
+    else:
+        print("Warning: No data was collected.")
 
 if __name__ == "__main__":
     main()
