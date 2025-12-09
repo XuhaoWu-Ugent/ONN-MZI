@@ -193,8 +193,12 @@ class MZI(nn.Module):
         Compute the 4×4 scattering matrix defined in AGENTS.md.
 
         Args:
-            voltage: Optional external voltage override. If None, uses the internal
-                    trainable _voltage parameter.
+            voltage: Optional external voltage override. 
+                     If None, uses the internal trainable _voltage parameter (scalar).
+                     If provided, can be scalar or tensor of shape (Batch,).
+        
+        Returns:
+            Matrix of shape (4, 4) if voltage is scalar, or (Batch, 4, 4) if batched.
         """
 
         params = self.physical_parameters()
@@ -207,7 +211,8 @@ class MZI(nn.Module):
         dtype = a.dtype
         device = a.device
 
-        # Use internal trainable voltage if no external voltage is provided
+        # Handle voltage input
+        is_batched = False
         if voltage is None:
             voltage_tensor = self._voltage.to(dtype=dtype, device=device).view(1)
         else:
@@ -215,12 +220,19 @@ class MZI(nn.Module):
                 voltage_tensor = torch.tensor(voltage, dtype=dtype, device=device)
             else:
                 voltage_tensor = voltage.to(device=device, dtype=dtype)
-            voltage_tensor = voltage_tensor.view(1)
+            
+            if voltage_tensor.numel() > 1:
+                is_batched = True
+                # Ensure it's 1D for calculation (Batch,)
+                voltage_tensor = voltage_tensor.reshape(-1)
+            else:
+                voltage_tensor = voltage_tensor.view(1)
 
         resistance = torch.clamp(
             torch.tensor(self.nominal_resistance, dtype=dtype, device=device) + delta_r,
             min=1.0,
         )
+        # delta_phi shape: (Batch,) or (1,)
         delta_phi = math.pi * (voltage_tensor**2) / (resistance * self.p_pi)
 
         phi1 = 0.5 * phi0 + delta_phi
@@ -235,8 +247,8 @@ class MZI(nn.Module):
         sqrt_b_1a = sqrt(clamp(b * (1.0 - a), min=eps))
         sqrt_1a_1b = sqrt(clamp((1.0 - a) * (1.0 - b), min=eps))
 
-        exp_phi1 = _exp_neg_j(phi1)
-        exp_phi2 = _exp_neg_j(phi2)
+        exp_phi1 = _exp_neg_j(phi1) # (Batch,)
+        exp_phi2 = _exp_neg_j(phi2) # Scalar
 
         alpha_real = self.alpha_amplitude.to(device=device, dtype=dtype)
         alpha = torch.complex(alpha_real, torch.zeros_like(alpha_real))
@@ -244,17 +256,26 @@ class MZI(nn.Module):
             torch.zeros_like(alpha_real), torch.ones_like(alpha_real)
         )
 
+        # Calculate S-parameters. These will broadcast to (Batch,) if exp_phi1 is batched.
         S31 = alpha * (sqrt_1a_1b * exp_phi1 - sqrt_ab * exp_phi2)
         S32 = -j_const * alpha * (sqrt_a_1b * exp_phi1 + sqrt_b_1a * exp_phi2)
         S41 = -j_const * alpha * (sqrt_b_1a * exp_phi1 + sqrt_a_1b * exp_phi2)
         S42 = alpha * (-sqrt_ab * exp_phi1 + sqrt_1a_1b * exp_phi2)
+        
         zero = torch.zeros_like(S31)
-        matrix = torch.stack([
-            torch.stack([zero, zero, S31, S41]),
-            torch.stack([zero, zero, S32, S42]),
-            torch.stack([S31, S32, zero, zero]),
-            torch.stack([S41, S42, zero, zero])
-        ]).squeeze(-1)
+        
+        # Stack into matrix
+        # If batched, Sxx are (Batch,). We want (Batch, 4, 4).
+        # If scalar, Sxx are scalar. We want (4, 4).
+        
+        # Row 0
+        r0 = torch.stack([zero, zero, S31, S41], dim=-1)
+        r1 = torch.stack([zero, zero, S32, S42], dim=-1)
+        r2 = torch.stack([S31, S32, zero, zero], dim=-1)
+        r3 = torch.stack([S41, S42, zero, zero], dim=-1)
+        
+        # (Batch, 4, 4) or (4, 4)
+        matrix = torch.stack([r0, r1, r2, r3], dim=-2)
 
         return matrix
 

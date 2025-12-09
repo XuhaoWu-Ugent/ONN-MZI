@@ -127,72 +127,117 @@ class MZIlayer_column(nn.Module):
 
         Args:
             device: Target device for the matrix.
-            voltage_overrides: Optional tensor of shape (num,) supplying explicit
-                               voltages for each MZI in this layer. If None, each
+            voltage_overrides: Optional tensor of shape (num,) or (Batch, num) supplying
+                               explicit voltages for each MZI in this layer. If None, each
                                MZI will use its internal trainable _voltage parameter.
+
+        Returns:
+            Transfer matrix of shape (matrix_size, matrix_size) if voltage_overrides is None or 1D,
+            or (Batch, matrix_size, matrix_size) if voltage_overrides is 2D.
         """
-        use_cache = ( voltage_overrides is None
+        # Check if we can use cache (only for non-batched, no voltage override case)
+        use_cache = (
+            not self.training
+            and voltage_overrides is None
             and self._cached_matrix is not None
             and self._cached_signature == self._parameter_signature()
         )
         if use_cache:
             return self._cached_matrix
 
-        matrix = torch.zeros(
-            (self.matrix_size, self.matrix_size),
-            dtype=torch.complex64,
-            device=device,
-        )
+        # Determine if batched
+        is_batched = voltage_overrides is not None and voltage_overrides.dim() == 2
+        batch_size = voltage_overrides.size(0) if is_batched else 1
 
-        # Prepare voltage vector if overrides are provided
-        voltage_vector = None
+        # Prepare voltage tensor
+        voltage_tensor = None
         if voltage_overrides is not None:
             param_dtype = self.MZI[0]._raw_a.dtype if self.MZI else torch.float32
-            voltage_vector = voltage_overrides.to(
-                device=device, dtype=param_dtype
-            ).view(-1)
-            if voltage_vector.numel() != self.num:
-                raise ValueError(
-                    f"Expected {self.num} voltages, got {voltage_vector.numel()}."
-                )
+            voltage_tensor = voltage_overrides.to(device=device, dtype=param_dtype)
 
-        # Top and bottom bypass ports propagate directly.
-        matrix[self.num_ports + 0, 0] = 1.0
-        matrix[0, self.num_ports + 0] = 1.0
-        matrix[self.num_ports + (self.num_ports - 1), self.num_ports - 1] = 1.0
-        matrix[self.num_ports - 1, self.num_ports + (self.num_ports - 1)] = 1.0
+            if voltage_tensor.dim() == 1:
+                if voltage_tensor.numel() != self.num:
+                    raise ValueError(
+                        f"Expected {self.num} voltages, got {voltage_tensor.numel()}."
+                    )
+                voltage_tensor = voltage_tensor.unsqueeze(0)  # (1, num)
+            elif voltage_tensor.dim() == 2:
+                if voltage_tensor.size(1) != self.num:
+                    raise ValueError(
+                        f"Expected {self.num} voltages per sample, got {voltage_tensor.size(1)}."
+                    )
+            else:
+                raise ValueError("voltage_overrides must be 1D or 2D tensor.")
 
-        for idx, mzi in enumerate(self.MZI):
-            # If voltage_vector is None, transfer_matrix will use the internal trainable _voltage
-            # If voltage_vector is provided, use the specific voltage for this MZI
-            mzi_voltage = voltage_vector[idx] if voltage_vector is not None else None
-            s_matrix = mzi.transfer_matrix(voltage=mzi_voltage).to(
-                device=device
+        # Initialize matrix
+        if is_batched:
+            matrix = torch.zeros(
+                (batch_size, self.matrix_size, self.matrix_size),
+                dtype=torch.complex64,
+                device=device,
             )
+        else:
+            matrix = torch.zeros(
+                (self.matrix_size, self.matrix_size),
+                dtype=torch.complex64,
+                device=device,
+            )
+
+        # Set bypass ports
+        if is_batched:
+            matrix[:, self.num_ports + 0, 0] = 1.0
+            matrix[:, 0, self.num_ports + 0] = 1.0
+            matrix[:, self.num_ports + (self.num_ports - 1), self.num_ports - 1] = 1.0
+            matrix[:, self.num_ports - 1, self.num_ports + (self.num_ports - 1)] = 1.0
+        else:
+            matrix[self.num_ports + 0, 0] = 1.0
+            matrix[0, self.num_ports + 0] = 1.0
+            matrix[self.num_ports + (self.num_ports - 1), self.num_ports - 1] = 1.0
+            matrix[self.num_ports - 1, self.num_ports + (self.num_ports - 1)] = 1.0
+
+        # Build transfer matrices for all MZIs
+        for idx, mzi in enumerate(self.MZI):
+            # Get voltage for this MZI
+            if voltage_tensor is not None:
+                mzi_voltage = voltage_tensor[:, idx]  # (Batch,) or (1,)
+            else:
+                mzi_voltage = None
+
+            # Get transfer matrix: (4, 4) or (Batch, 4, 4)
+            s_matrix = mzi.transfer_matrix(voltage=mzi_voltage).to(device=device)
 
             upper = 2 * idx + 1
             lower = upper + 1
 
-            matrix[self.num_ports + upper, upper] = s_matrix[2, 0]
-            matrix[self.num_ports + upper, lower] = s_matrix[2, 1]
-            matrix[self.num_ports + lower, upper] = s_matrix[3, 0]
-            matrix[self.num_ports + lower, lower] = s_matrix[3, 1]
+            # Define index mappings (same for all batches)
+            indices_mapping = [
+                (self.num_ports + upper, upper, 2, 0),
+                (self.num_ports + upper, lower, 2, 1),
+                (self.num_ports + lower, upper, 3, 0),
+                (self.num_ports + lower, lower, 3, 1),
+                (upper, self.num_ports + upper, 0, 2),
+                (upper, self.num_ports + lower, 0, 3),
+                (lower, self.num_ports + upper, 1, 2),
+                (lower, self.num_ports + lower, 1, 3),
+                (upper, upper, 0, 0),
+                (upper, lower, 0, 1),
+                (lower, upper, 1, 0),
+                (lower, lower, 1, 1),
+                (self.num_ports + upper, self.num_ports + upper, 2, 2),
+                (self.num_ports + upper, self.num_ports + lower, 2, 3),
+                (self.num_ports + lower, self.num_ports + upper, 3, 2),
+                (self.num_ports + lower, self.num_ports + lower, 3, 3),
+            ]
 
-            matrix[upper, self.num_ports + upper] = s_matrix[0, 2]
-            matrix[upper, self.num_ports + lower] = s_matrix[0, 3]
-            matrix[lower, self.num_ports + upper] = s_matrix[1, 2]
-            matrix[lower, self.num_ports + lower] = s_matrix[1, 3]
+            # Assign values
+            if s_matrix.dim() == 2:  # Non-batched (4, 4)
+                for i, j, si, sj in indices_mapping:
+                    matrix[i, j] = s_matrix[si, sj]
+            else:  # Batched (Batch, 4, 4)
+                for i, j, si, sj in indices_mapping:
+                    matrix[:, i, j] = s_matrix[:, si, sj]
 
-            matrix[upper, upper] = s_matrix[0, 0]
-            matrix[upper, lower] = s_matrix[0, 1]
-            matrix[lower, upper] = s_matrix[1, 0]
-            matrix[lower, lower] = s_matrix[1, 1]
-
-            matrix[self.num_ports + upper, self.num_ports + upper] = s_matrix[2, 2]
-            matrix[self.num_ports + upper, self.num_ports + lower] = s_matrix[2, 3]
-            matrix[self.num_ports + lower, self.num_ports + upper] = s_matrix[3, 2]
-            matrix[self.num_ports + lower, self.num_ports + lower] = s_matrix[3, 3]
-
+        # Cache if applicable
         if voltage_overrides is None and not self.training:
             self._cached_matrix = matrix.detach().clone()
             self._cached_device = device
@@ -245,6 +290,7 @@ class MZIlayer_column(nn.Module):
         batch_total = input_flat.shape[0]
 
         if voltage_matrix is None:
+            # No voltage override: use single cached transfer matrix
             transfer = self._build_transfer_matrix(device)
 
             state_vectors = torch.zeros(
@@ -255,22 +301,30 @@ class MZIlayer_column(nn.Module):
             new_states = torch.matmul(state_vectors, transfer.T)
             output_flat = new_states[:, self.num_ports : self.num_ports + num_ports]
         else:
+            # Voltage override: build batched transfer matrices
             voltage_flat = voltage_matrix.unsqueeze(1).repeat(1, num_patches, 1)
             voltage_flat = voltage_flat.reshape(batch_total, self.num)
 
-            output_chunks = []
-            for sample_idx in range(batch_total):
-                transfer = self._build_transfer_matrix(
-                    device, voltage_overrides=voltage_flat[sample_idx]
-                )
-                state_vector = torch.zeros(
-                    self.matrix_size, dtype=torch.complex64, device=device
-                )
-                state_vector[:num_ports] = input_flat[sample_idx]
-                new_state = torch.matmul(state_vector, transfer.T)
-                output_chunks.append(new_state[self.num_ports : self.num_ports + num_ports])
+            # Build batched transfer matrices (Batch_Total, matrix_size, matrix_size)
+            transfer_batched = self._build_transfer_matrix(
+                device, voltage_overrides=voltage_flat
+            )
 
-            output_flat = torch.stack(output_chunks, dim=0)
+            # Prepare state vectors (Batch_Total, matrix_size)
+            state_vectors = torch.zeros(
+                batch_total, self.matrix_size, dtype=torch.complex64, device=device
+            )
+            state_vectors[:, :num_ports] = input_flat
+
+            # Vectorized batch matrix multiplication
+            # state_vectors: (Batch_Total, matrix_size)
+            # transfer_batched.transpose(-2, -1): (Batch_Total, matrix_size, matrix_size)
+            # Result: (Batch_Total, matrix_size)
+            new_states = torch.bmm(
+                state_vectors.unsqueeze(1), transfer_batched.transpose(-2, -1)
+            ).squeeze(1)
+
+            output_flat = new_states[:, self.num_ports : self.num_ports + num_ports]
 
         output = output_flat.view(batch_size, num_patches, num_ports)
 
