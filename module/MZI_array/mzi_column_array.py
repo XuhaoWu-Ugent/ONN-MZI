@@ -80,14 +80,28 @@ class MZIlayer_column(nn.Module):
             voltage_tensor = torch.as_tensor(voltages, dtype=dtype, device=device)
 
         if voltage_tensor.dim() == 1:
+            # Case 1: Compact voltage vector (length == num MZIs in this layer)
+            if voltage_tensor.numel() == self.num:
+                return voltage_tensor.unsqueeze(0).expand(batch_size, -1)
+                
+            # Case 2: Global voltage vector (must cover the max index)
             if voltage_tensor.numel() < max(self.mzi_indices) + 1:
                 raise ValueError(
-                    "Voltage vector is too short for the configured MZI indices."
+                    f"Voltage vector too short. Expected length {self.num} (compact) or >= {max(self.mzi_indices) + 1} (global), got {voltage_tensor.numel()}."
                 )
             selected = voltage_tensor[self.mzi_indices]
             return selected.unsqueeze(0).expand(batch_size, -1)
 
         if voltage_tensor.dim() == 2:
+            # Case 1: Compact voltage matrix (cols == num MZIs)
+            if voltage_tensor.size(1) == self.num:
+                 if voltage_tensor.size(0) == batch_size:
+                    return voltage_tensor
+                 if voltage_tensor.size(0) == 1:
+                    return voltage_tensor.expand(batch_size, -1)
+                 raise ValueError(f"Voltage batch size mismatch. Expected {batch_size}, got {voltage_tensor.size(0)}.")
+
+            # Case 2: Global voltage matrix
             if voltage_tensor.size(1) < max(self.mzi_indices) + 1:
                 raise ValueError(
                     "Voltage matrix does not have enough columns for slicing."
