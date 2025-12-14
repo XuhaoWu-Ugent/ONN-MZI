@@ -9,6 +9,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torchvision import datasets, transforms
 
 # Import FIXED MZI implementations
@@ -571,13 +574,59 @@ def load_mzi_parameters(model, json_path="results/mzi_parameters.json"):
                 count += 1
     print(f"Applied calibrated parameters to {count} MZI instances.")
 
+def setup_distributed():
+    """
+    Initialize distributed training environment.
+    Supports both SLURM and torchrun/torch.distributed.launch.
+    """
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        # torchrun sets RANK and WORLD_SIZE
+        rank = int(os.environ['RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+        local_rank = int(os.environ['LOCAL_RANK'])
+    elif 'SLURM_PROCID' in os.environ:
+        # SLURM environment
+        rank = int(os.environ['SLURM_PROCID'])
+        world_size = int(os.environ['SLURM_NTASKS'])
+        local_rank = int(os.environ['SLURM_LOCALID'])
+
+        # Setup for NCCL backend
+        os.environ['RANK'] = str(rank)
+        os.environ['WORLD_SIZE'] = str(world_size)
+        os.environ['LOCAL_RANK'] = str(local_rank)
+    else:
+        # Single GPU or CPU
+        rank = 0
+        world_size = 1
+        local_rank = 0
+
+    # Initialize process group
+    if world_size > 1:
+        dist.init_process_group(
+            backend='nccl',
+            init_method='env://',
+            world_size=world_size,
+            rank=rank
+        )
+
+    return rank, local_rank, world_size
+
+def cleanup_distributed():
+    """Clean up distributed training."""
+    if dist.is_initialized():
+        dist.destroy_process_group()
+
+def is_main_process(rank):
+    """Check if current process is main process (rank 0)."""
+    return rank == 0
+
 def set_seed(seed):
     import random, numpy as np
     random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = False
     torch.backends.cudnn.benchmark = True
 
-def get_loaders(cfg: CFG, root="./data"):
+def get_loaders(cfg: CFG, root="./data", distributed=False, world_size=1, rank=0):
     mean, std = 0.1307, 0.3081
     train_tf = transforms.Compose([
         transforms.Resize((cfg.img_size, cfg.img_size)),
@@ -593,22 +642,67 @@ def get_loaders(cfg: CFG, root="./data"):
     train_ds = datasets.MNIST(root, train=True, download=True, transform=train_tf)
     test_ds  = datasets.MNIST(root, train=False, download=True, transform=test_tf)
 
-    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True,
-                              num_workers=cfg.num_workers, pin_memory=True)
-    test_loader  = DataLoader(test_ds, batch_size=cfg.batch_size, shuffle=False,
-                              num_workers=cfg.num_workers, pin_memory=True)
+    # Use DistributedSampler for multi-GPU training
+    if distributed:
+        train_sampler = DistributedSampler(
+            train_ds,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True
+        )
+        test_sampler = DistributedSampler(
+            test_ds,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=False
+        )
+
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=cfg.batch_size,
+            sampler=train_sampler,
+            num_workers=cfg.num_workers,
+            pin_memory=True
+        )
+        test_loader = DataLoader(
+            test_ds,
+            batch_size=cfg.batch_size,
+            sampler=test_sampler,
+            num_workers=cfg.num_workers,
+            pin_memory=True
+        )
+    else:
+        train_loader = DataLoader(
+            train_ds,
+            batch_size=cfg.batch_size,
+            shuffle=True,
+            num_workers=cfg.num_workers,
+            pin_memory=True
+        )
+        test_loader = DataLoader(
+            test_ds,
+            batch_size=cfg.batch_size,
+            shuffle=False,
+            num_workers=cfg.num_workers,
+            pin_memory=True
+        )
+
     return train_loader, test_loader
 
-def save_checkpoint(state, checkpoint_dir="checkpoints", filename="checkpoint_latest.pt", is_best=False):
+def save_checkpoint(state, checkpoint_dir="checkpoints", filename="checkpoint_latest.pt", is_best=False, rank=0):
     """
-    Save training checkpoint.
+    Save training checkpoint (only on rank 0 for distributed training).
 
     Args:
         state: Dict containing model, optimizer, scheduler states, etc.
         checkpoint_dir: Directory to save checkpoints
         filename: Checkpoint filename
         is_best: If True, also save as best model
+        rank: Process rank (only rank 0 saves)
     """
+    if rank != 0:
+        return  # Only save on main process
+
     os.makedirs(checkpoint_dir, exist_ok=True)
     filepath = os.path.join(checkpoint_dir, filename)
     torch.save(state, filepath)
@@ -621,10 +715,11 @@ def save_checkpoint(state, checkpoint_dir="checkpoints", filename="checkpoint_la
 def load_checkpoint(checkpoint_path, model, optimizer=None, scheduler=None, scaler=None):
     """
     Load checkpoint and restore training state.
+    Handles both parallel (DDP/DataParallel) and non-parallel checkpoints automatically.
 
     Args:
         checkpoint_path: Path to checkpoint file
-        model: Model to load state into
+        model: Model to load state into (can be DDP, DataParallel, or standard model)
         optimizer: Optimizer to load state into (optional)
         scheduler: LR scheduler to load state into (optional)
         scaler: GradScaler to load state into (optional)
@@ -637,10 +732,28 @@ def load_checkpoint(checkpoint_path, model, optimizer=None, scheduler=None, scal
         return None
 
     print(f"Loading checkpoint from {checkpoint_path}...")
-    checkpoint = torch.load(checkpoint_path)
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
 
-    # Load model state
-    model.load_state_dict(checkpoint['model_state_dict'])
+    # Load model state - handle parallel wrapped models (DDP or DataParallel)
+    state_dict = checkpoint['model_state_dict']
+
+    # Check if model is wrapped (DDP or DataParallel)
+    is_model_parallel = isinstance(model, (DDP, nn.DataParallel))
+
+    # Check if checkpoint is from parallel model (has 'module.' prefix)
+    is_checkpoint_parallel = any(key.startswith('module.') for key in state_dict.keys())
+
+    # Handle mismatches between parallel and non-parallel models
+    if is_model_parallel and not is_checkpoint_parallel:
+        # Loading non-parallel checkpoint into parallel model
+        # Parallel models expect "module." prefix
+        state_dict = {f'module.{k}': v for k, v in state_dict.items()}
+    elif not is_model_parallel and is_checkpoint_parallel:
+        # Loading parallel checkpoint into non-parallel model
+        # Remove "module." prefix
+        state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
+
+    model.load_state_dict(state_dict)
     print(f"  Loaded model state from epoch {checkpoint['epoch']}")
 
     # Load optimizer state
@@ -685,13 +798,39 @@ def main():
     parser.add_argument("--save-every", type=int, default=1,
                         help="Save checkpoint every N epochs (default: 1)")
 
+    # Distributed training arguments
+    parser.add_argument("--distributed", action="store_true",
+                        help="Enable distributed training (multi-GPU)")
+    parser.add_argument("--local_rank", type=int, default=0,
+                        help="Local rank for distributed training (set automatically by launcher)")
+
     args = parser.parse_args()
 
-    cfg = CFG(epochs=args.epochs, batch_size=args.bs, lr=args.lr, amp=not args.no_amp, depth=args.depth)
-    set_seed(cfg.seed)
+    # Setup distributed training
+    if args.distributed or 'RANK' in os.environ or 'SLURM_PROCID' in os.environ:
+        rank, local_rank, world_size = setup_distributed()
+        distributed = True
+    else:
+        rank, local_rank, world_size = 0, 0, 1
+        distributed = False
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    train_loader, test_loader = get_loaders(cfg)
+    # Set device
+    if torch.cuda.is_available():
+        if distributed:
+            torch.cuda.set_device(local_rank)
+            device = torch.device(f"cuda:{local_rank}")
+        else:
+            device = torch.device("cuda")
+    else:
+        device = torch.device("cpu")
+
+    # Only print on main process
+    is_main = is_main_process(rank)
+
+    cfg = CFG(epochs=args.epochs, batch_size=args.bs, lr=args.lr, amp=not args.no_amp, depth=args.depth)
+    set_seed(cfg.seed + rank)  # Different seed per rank for data augmentation diversity
+
+    train_loader, test_loader = get_loaders(cfg, distributed=distributed, world_size=world_size, rank=rank)
 
     # Initialize model with ConvFFN (Optical Convolution)
     model = ViT(
@@ -702,12 +841,21 @@ def main():
 
     load_mzi_parameters(model, json_path="results/mzi_parameters.json")
 
-    total_params = sum(p.numel() for p in model.parameters())
-    print("=== OPTIMIZED OPTICAL CONVOLUTION ViT Model ===")
-    print(f"Device: {device}")
-    print(f"Total parameters: {total_params:,}")
-    print(f"Batch size: {cfg.batch_size}")
-    print()
+    # Wrap model with DDP for distributed training
+    if distributed:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+        if is_main:
+            print(f"Using DistributedDataParallel on {world_size} GPUs")
+
+    if is_main:
+        total_params = sum(p.numel() for p in model.parameters())
+        print("=== OPTIMIZED OPTICAL CONVOLUTION ViT Model ===")
+        print(f"Device: {device}")
+        print(f"Distributed: {distributed} (World Size: {world_size})")
+        print(f"Total parameters: {total_params:,}")
+        print(f"Batch size per GPU: {cfg.batch_size}")
+        print(f"Effective batch size: {cfg.batch_size * world_size}")
+        print()
 
     criterion = nn.CrossEntropyLoss(label_smoothing=cfg.label_smoothing)
     optimizer = AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
@@ -741,16 +889,24 @@ def main():
             start_epoch = resume_info['start_epoch']
             best_acc = resume_info['best_acc']
             step = resume_info['step']
-            print(f"\n✓ Resuming training from epoch {start_epoch}")
+            if is_main:
+                print(f"\n✓ Resuming training from epoch {start_epoch}")
         else:
-            print("\n✗ Failed to load checkpoint, starting from scratch")
+            if is_main:
+                print("\n✗ Failed to load checkpoint, starting from scratch")
     else:
-        print("\nNo checkpoint found, starting training from scratch")
+        if is_main:
+            print("\nNo checkpoint found, starting training from scratch")
 
-    print("Starting training with OPTICAL CONVOLUTION layers...")
-    print()
+    if is_main:
+        print("Starting training with OPTICAL CONVOLUTION layers...")
+        print()
 
     for epoch in range(start_epoch, cfg.epochs):
+        # Set epoch for distributed sampler
+        if distributed and hasattr(train_loader.sampler, 'set_epoch'):
+            train_loader.sampler.set_epoch(epoch)
+
         model.train()
         epoch_start = time.time()
         epoch_loss = 0.0
@@ -773,7 +929,7 @@ def main():
             num_batches += 1
             step += 1
 
-            if batch_idx % 50 == 0:
+            if batch_idx % 50 == 0 and is_main:
                 print(f"  Batch {batch_idx:3d}/{len(train_loader):3d}, "
                       f"Loss: {loss.item():.4f}, "
                       f"LR: {optimizer.param_groups[0]['lr']:.6f}")
@@ -791,27 +947,44 @@ def main():
                 correct += (pred == y).sum().item()
                 n += y.size(0)
 
+        # Aggregate results across all GPUs in distributed training
+        if distributed:
+            correct_tensor = torch.tensor(correct, device=device)
+            n_tensor = torch.tensor(n, device=device)
+            dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
+            dist.all_reduce(n_tensor, op=dist.ReduceOp.SUM)
+            correct = correct_tensor.item()
+            n = n_tensor.item()
+
         acc = correct / n
         epoch_time = time.time() - epoch_start
         eval_time = time.time() - eval_start
         avg_loss = epoch_loss / num_batches
 
-        print(f"Epoch {epoch+1:02d}/{cfg.epochs} | "
-              f"Loss: {avg_loss:.4f} | "
-              f"Acc: {acc*100:.2f}% | "
-              f"Time: {epoch_time:.1f}s | "
-              f"Eval: {eval_time:.1f}s")
+        if is_main:
+            print(f"Epoch {epoch+1:02d}/{cfg.epochs} | "
+                  f"Loss: {avg_loss:.4f} | "
+                  f"Acc: {acc*100:.2f}% | "
+                  f"Time: {epoch_time:.1f}s | "
+                  f"Eval: {eval_time:.1f}s")
 
         # Save checkpoint
         is_best = acc > best_acc
         if is_best:
             best_acc = acc
-            print(f"  -> New best accuracy: {best_acc*100:.2f}%")
+            if is_main:
+                print(f"  -> New best accuracy: {best_acc*100:.2f}%")
 
-        # Prepare checkpoint state
+        # Prepare checkpoint state (use module.state_dict() if DDP or DataParallel)
+        # Both DDP and DataParallel wrap the model in .module
+        if isinstance(model, (DDP, nn.DataParallel)):
+            model_state = model.module.state_dict()
+        else:
+            model_state = model.state_dict()
+
         checkpoint_state = {
             'epoch': epoch,
-            'model_state_dict': model.state_dict(),
+            'model_state_dict': model_state,
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
             'scaler_state_dict': scaler.state_dict(),
@@ -831,25 +1004,30 @@ def main():
             }
         }
 
-        # Save checkpoint every N epochs or if best
+        # Save checkpoint every N epochs or if best (only on rank 0)
         if (epoch + 1) % args.save_every == 0 or is_best:
             save_checkpoint(
                 checkpoint_state,
                 checkpoint_dir=args.checkpoint_dir,
                 filename="checkpoint_latest.pt",
-                is_best=is_best
+                is_best=is_best,
+                rank=rank
             )
 
-        # Also save legacy format for compatibility
-        if is_best:
-            torch.save({"model": model.state_dict()}, "mnist_vit_optical_conv_best.pt")
+        # Also save legacy format for compatibility (only on rank 0)
+        if is_best and is_main:
+            torch.save({"model": model_state}, "mnist_vit_optical_conv_best.pt")
 
-        print()
+        if is_main:
+            print()
 
-    print(f"Training completed!")
-    print(f"Best validation accuracy: {best_acc*100:.2f}%")
-    
-    # Optional: Add hardware data collection if needed (omitted for brevity unless requested)
+    if is_main:
+        print(f"Training completed!")
+        print(f"Best validation accuracy: {best_acc*100:.2f}%")
+
+    # Cleanup distributed training
+    if distributed:
+        cleanup_distributed()
 
 if __name__ == "__main__":
     main()
