@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import math, time, argparse
+import math, time, argparse, os
 from dataclasses import dataclass
 
 import torch
@@ -599,6 +599,74 @@ def get_loaders(cfg: CFG, root="./data"):
                               num_workers=cfg.num_workers, pin_memory=True)
     return train_loader, test_loader
 
+def save_checkpoint(state, checkpoint_dir="checkpoints", filename="checkpoint_latest.pt", is_best=False):
+    """
+    Save training checkpoint.
+
+    Args:
+        state: Dict containing model, optimizer, scheduler states, etc.
+        checkpoint_dir: Directory to save checkpoints
+        filename: Checkpoint filename
+        is_best: If True, also save as best model
+    """
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    filepath = os.path.join(checkpoint_dir, filename)
+    torch.save(state, filepath)
+
+    if is_best:
+        best_path = os.path.join(checkpoint_dir, "checkpoint_best.pt")
+        torch.save(state, best_path)
+        print(f"  -> Saved best checkpoint to {best_path}")
+
+def load_checkpoint(checkpoint_path, model, optimizer=None, scheduler=None, scaler=None):
+    """
+    Load checkpoint and restore training state.
+
+    Args:
+        checkpoint_path: Path to checkpoint file
+        model: Model to load state into
+        optimizer: Optimizer to load state into (optional)
+        scheduler: LR scheduler to load state into (optional)
+        scaler: GradScaler to load state into (optional)
+
+    Returns:
+        Dict with start_epoch, best_acc, and other metadata
+    """
+    if not os.path.exists(checkpoint_path):
+        print(f"Checkpoint not found: {checkpoint_path}")
+        return None
+
+    print(f"Loading checkpoint from {checkpoint_path}...")
+    checkpoint = torch.load(checkpoint_path)
+
+    # Load model state
+    model.load_state_dict(checkpoint['model_state_dict'])
+    print(f"  Loaded model state from epoch {checkpoint['epoch']}")
+
+    # Load optimizer state
+    if optimizer is not None and 'optimizer_state_dict' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        print("  Loaded optimizer state")
+
+    # Load scheduler state
+    if scheduler is not None and 'scheduler_state_dict' in checkpoint:
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        print("  Loaded scheduler state")
+
+    # Load scaler state (for mixed precision)
+    if scaler is not None and 'scaler_state_dict' in checkpoint:
+        scaler.load_state_dict(checkpoint['scaler_state_dict'])
+        print("  Loaded scaler state")
+
+    resume_info = {
+        'start_epoch': checkpoint['epoch'] + 1,
+        'best_acc': checkpoint.get('best_acc', 0.0),
+        'step': checkpoint.get('step', 0)
+    }
+
+    print(f"  Resume from epoch {resume_info['start_epoch']}, best acc: {resume_info['best_acc']*100:.2f}%")
+    return resume_info
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs", type=int, default=CFG.epochs)
@@ -606,6 +674,17 @@ def main():
     parser.add_argument("--lr", type=float, default=CFG.lr)
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument("--depth", type=int, default=CFG.depth)
+
+    # Checkpoint arguments
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Path to checkpoint to resume from (default: auto-detect checkpoints/checkpoint_latest.pt)")
+    parser.add_argument("--checkpoint-dir", type=str, default="checkpoints",
+                        help="Directory to save checkpoints")
+    parser.add_argument("--no-resume", action="store_true",
+                        help="Start training from scratch, ignore existing checkpoints")
+    parser.add_argument("--save-every", type=int, default=1,
+                        help="Save checkpoint every N epochs (default: 1)")
+
     args = parser.parse_args()
 
     cfg = CFG(epochs=args.epochs, batch_size=args.bs, lr=args.lr, amp=not args.no_amp, depth=args.depth)
@@ -637,13 +716,41 @@ def main():
 
     scaler = torch.cuda.amp.GradScaler(enabled=cfg.amp)
 
+    # Initialize training state
     best_acc = 0.0
     step = 0
+    start_epoch = 0
+
+    # Handle checkpoint resumption
+    resume_path = None
+    if not args.no_resume:
+        if args.resume:
+            # User specified checkpoint path
+            resume_path = args.resume
+        else:
+            # Auto-detect latest checkpoint
+            auto_checkpoint = os.path.join(args.checkpoint_dir, "checkpoint_latest.pt")
+            if os.path.exists(auto_checkpoint):
+                resume_path = auto_checkpoint
+
+    if resume_path:
+        resume_info = load_checkpoint(
+            resume_path, model, optimizer, scheduler, scaler
+        )
+        if resume_info:
+            start_epoch = resume_info['start_epoch']
+            best_acc = resume_info['best_acc']
+            step = resume_info['step']
+            print(f"\n✓ Resuming training from epoch {start_epoch}")
+        else:
+            print("\n✗ Failed to load checkpoint, starting from scratch")
+    else:
+        print("\nNo checkpoint found, starting training from scratch")
 
     print("Starting training with OPTICAL CONVOLUTION layers...")
     print()
 
-    for epoch in range(cfg.epochs):
+    for epoch in range(start_epoch, cfg.epochs):
         model.train()
         epoch_start = time.time()
         epoch_loss = 0.0
@@ -695,10 +802,47 @@ def main():
               f"Time: {epoch_time:.1f}s | "
               f"Eval: {eval_time:.1f}s")
 
-        if acc > best_acc:
+        # Save checkpoint
+        is_best = acc > best_acc
+        if is_best:
             best_acc = acc
-            torch.save({"model": model.state_dict()}, "mnist_vit_optical_conv_best.pt")
             print(f"  -> New best accuracy: {best_acc*100:.2f}%")
+
+        # Prepare checkpoint state
+        checkpoint_state = {
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+            'scaler_state_dict': scaler.state_dict(),
+            'best_acc': best_acc,
+            'acc': acc,
+            'loss': avg_loss,
+            'step': step,
+            'config': {
+                'img_size': cfg.img_size,
+                'patch': cfg.patch,
+                'embed': cfg.embed,
+                'depth': cfg.depth,
+                'heads': cfg.heads,
+                'epochs': cfg.epochs,
+                'batch_size': cfg.batch_size,
+                'lr': cfg.lr,
+            }
+        }
+
+        # Save checkpoint every N epochs or if best
+        if (epoch + 1) % args.save_every == 0 or is_best:
+            save_checkpoint(
+                checkpoint_state,
+                checkpoint_dir=args.checkpoint_dir,
+                filename="checkpoint_latest.pt",
+                is_best=is_best
+            )
+
+        # Also save legacy format for compatibility
+        if is_best:
+            torch.save({"model": model.state_dict()}, "mnist_vit_optical_conv_best.pt")
 
         print()
 
