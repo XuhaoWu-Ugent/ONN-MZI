@@ -579,37 +579,57 @@ def setup_distributed():
     Initialize distributed training environment.
     Supports both SLURM and torchrun/torch.distributed.launch.
     """
-    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
-        # torchrun sets RANK and WORLD_SIZE
-        rank = int(os.environ['RANK'])
-        world_size = int(os.environ['WORLD_SIZE'])
-        local_rank = int(os.environ['LOCAL_RANK'])
-    elif 'SLURM_PROCID' in os.environ:
-        # SLURM environment
-        rank = int(os.environ['SLURM_PROCID'])
-        world_size = int(os.environ['SLURM_NTASKS'])
-        local_rank = int(os.environ['SLURM_LOCALID'])
+    try:
+        if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+            # torchrun sets RANK and WORLD_SIZE
+            rank = int(os.environ['RANK'])
+            world_size = int(os.environ['WORLD_SIZE'])
+            local_rank = int(os.environ['LOCAL_RANK'])
+            print(f"[Rank {rank}] Detected torchrun environment: world_size={world_size}, local_rank={local_rank}")
+        elif 'SLURM_PROCID' in os.environ:
+            # SLURM environment
+            rank = int(os.environ['SLURM_PROCID'])
+            world_size = int(os.environ['SLURM_NTASKS'])
+            local_rank = int(os.environ['SLURM_LOCALID'])
 
-        # Setup for NCCL backend
-        os.environ['RANK'] = str(rank)
-        os.environ['WORLD_SIZE'] = str(world_size)
-        os.environ['LOCAL_RANK'] = str(local_rank)
-    else:
-        # Single GPU or CPU
-        rank = 0
-        world_size = 1
-        local_rank = 0
+            # Setup for NCCL backend
+            os.environ['RANK'] = str(rank)
+            os.environ['WORLD_SIZE'] = str(world_size)
+            os.environ['LOCAL_RANK'] = str(local_rank)
+            print(f"[Rank {rank}] Detected SLURM environment: world_size={world_size}, local_rank={local_rank}")
+        else:
+            # Single GPU or CPU
+            rank = 0
+            world_size = 1
+            local_rank = 0
+            print("No distributed environment detected, using single process")
 
-    # Initialize process group
-    if world_size > 1:
-        dist.init_process_group(
-            backend='nccl',
-            init_method='env://',
-            world_size=world_size,
-            rank=rank
-        )
+        # Initialize process group
+        if world_size > 1:
+            print(f"[Rank {rank}] Initializing distributed training...")
 
-    return rank, local_rank, world_size
+            # Choose backend based on device availability
+            if torch.cuda.is_available():
+                backend = 'nccl'
+            else:
+                backend = 'gloo'
+                print(f"[Rank {rank}] CUDA not available, using Gloo backend instead of NCCL")
+
+            dist.init_process_group(
+                backend=backend,
+                init_method='env://',
+                world_size=world_size,
+                rank=rank
+            )
+            print(f"[Rank {rank}] Distributed training initialized successfully with {backend} backend")
+
+        return rank, local_rank, world_size
+
+    except Exception as e:
+        print(f"ERROR in setup_distributed: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
 
 def cleanup_distributed():
     """Clean up distributed training."""
@@ -639,8 +659,24 @@ def get_loaders(cfg: CFG, root="./data", distributed=False, world_size=1, rank=0
         transforms.ToTensor(),
         transforms.Normalize((mean,), (std,))
     ])
-    train_ds = datasets.MNIST(root, train=True, download=True, transform=train_tf)
-    test_ds  = datasets.MNIST(root, train=False, download=True, transform=test_tf)
+
+    # In distributed training, only rank 0 should download the dataset
+    # Other ranks wait until download is complete
+    if distributed:
+        if rank == 0:
+            # Rank 0 downloads the dataset
+            train_ds = datasets.MNIST(root, train=True, download=True, transform=train_tf)
+            test_ds  = datasets.MNIST(root, train=False, download=True, transform=test_tf)
+        # Wait for rank 0 to finish downloading
+        dist.barrier()
+        if rank != 0:
+            # Other ranks load the already-downloaded dataset
+            train_ds = datasets.MNIST(root, train=True, download=False, transform=train_tf)
+            test_ds  = datasets.MNIST(root, train=False, download=False, transform=test_tf)
+    else:
+        # Non-distributed mode: download normally
+        train_ds = datasets.MNIST(root, train=True, download=True, transform=train_tf)
+        test_ds  = datasets.MNIST(root, train=False, download=True, transform=test_tf)
 
     # Use DistributedSampler for multi-GPU training
     if distributed:
@@ -806,6 +842,13 @@ def main():
 
     args = parser.parse_args()
 
+    # Print startup info
+    print("\n" + "=" * 60)
+    print("Starting train_mnist_vit.py")
+    print("=" * 60)
+    print(f"Arguments: {vars(args)}")
+    print("=" * 60 + "\n")
+
     # Setup distributed training
     if args.distributed or 'RANK' in os.environ or 'SLURM_PROCID' in os.environ:
         rank, local_rank, world_size = setup_distributed()
@@ -830,16 +873,45 @@ def main():
     cfg = CFG(epochs=args.epochs, batch_size=args.bs, lr=args.lr, amp=not args.no_amp, depth=args.depth)
     set_seed(cfg.seed + rank)  # Different seed per rank for data augmentation diversity
 
-    train_loader, test_loader = get_loaders(cfg, distributed=distributed, world_size=world_size, rank=rank)
+    try:
+        if is_main:
+            print("Loading MNIST dataset...")
+        train_loader, test_loader = get_loaders(cfg, distributed=distributed, world_size=world_size, rank=rank)
+        if is_main:
+            print(f"[OK] Dataset loaded: {len(train_loader.dataset)} training samples, {len(test_loader.dataset)} test samples")
+    except Exception as e:
+        print(f"ERROR: Failed to load dataset: {e}")
+        import traceback
+        traceback.print_exc()
+        if distributed:
+            cleanup_distributed()
+        raise
 
     # Initialize model with ConvFFN (Optical Convolution)
-    model = ViT(
-        img_size=cfg.img_size, patch_size=cfg.patch, in_chans=1, num_classes=10,
-        embed_dim=cfg.embed, depth=cfg.depth, num_heads=cfg.heads,
-        mlp_ratio=4.0, drop_rate=0.0, attn_drop_rate=0.0, drop_path_rate=0.1
-    ).to(device)
+    try:
+        if is_main:
+            print("Creating ViT model with optical convolution...")
+        model = ViT(
+            img_size=cfg.img_size, patch_size=cfg.patch, in_chans=1, num_classes=10,
+            embed_dim=cfg.embed, depth=cfg.depth, num_heads=cfg.heads,
+            mlp_ratio=4.0, drop_rate=0.0, attn_drop_rate=0.0, drop_path_rate=0.1
+        ).to(device)
+        if is_main:
+            print("[OK] Model created successfully")
+    except Exception as e:
+        print(f"ERROR: Failed to create model: {e}")
+        import traceback
+        traceback.print_exc()
+        if distributed:
+            cleanup_distributed()
+        raise
 
-    load_mzi_parameters(model, json_path="results/mzi_parameters.json")
+    try:
+        load_mzi_parameters(model, json_path="results/mzi_parameters.json")
+    except Exception as e:
+        if is_main:
+            print(f"Warning: Failed to load MZI parameters: {e}")
+            print("Continuing with default parameters...")
 
     # Wrap model with DDP for distributed training
     if distributed:
@@ -890,10 +962,10 @@ def main():
             best_acc = resume_info['best_acc']
             step = resume_info['step']
             if is_main:
-                print(f"\n✓ Resuming training from epoch {start_epoch}")
+                print(f"\n[OK] Resuming training from epoch {start_epoch}")
         else:
             if is_main:
-                print("\n✗ Failed to load checkpoint, starting from scratch")
+                print("\n[WARN] Failed to load checkpoint, starting from scratch")
     else:
         if is_main:
             print("\nNo checkpoint found, starting training from scratch")
@@ -1030,4 +1102,23 @@ def main():
         cleanup_distributed()
 
 if __name__ == "__main__":
-    main()
+    try:
+        # Create necessary directories
+        os.makedirs("checkpoints", exist_ok=True)
+        os.makedirs("results", exist_ok=True)
+        os.makedirs("logs", exist_ok=True)
+        os.makedirs("data", exist_ok=True)
+
+        main()
+    except KeyboardInterrupt:
+        print("\n\nTraining interrupted by user")
+        if dist.is_initialized():
+            cleanup_distributed()
+        exit(0)
+    except Exception as e:
+        print(f"\n\nFATAL ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        if dist.is_initialized():
+            cleanup_distributed()
+        exit(1)
