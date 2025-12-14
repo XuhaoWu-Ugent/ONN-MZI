@@ -28,10 +28,10 @@ class OpticalCore10x10(nn.Module):
         super().__init__()
         self.layers = nn.ModuleList()
         self.mzi_counts = []
-        
-        # We supply voltages externally from BlockMZILinear, so disable internal trainable voltages
+
+        # We supply voltages externally, so disable internal trainable voltages
         mzi_kwargs = {"trainable_voltage": False}
-        
+
         # Build the Clements-style 10x10 mesh structure (50 MZIs total)
         # Structure: 5x [Row(5) -> Col(4)] -> Row(5)
         mzi_idx = 0
@@ -39,102 +39,291 @@ class OpticalCore10x10(nn.Module):
             self.layers.append(MZIlayer_row(num=5, start_index=mzi_idx, mzi_kwargs=mzi_kwargs))
             self.mzi_counts.append(5)
             mzi_idx += 5
-            
+
             self.layers.append(MZIlayer_column(num=4, start_index=mzi_idx, mzi_kwargs=mzi_kwargs))
             self.mzi_counts.append(4)
             mzi_idx += 4
-            
+
         self.layers.append(MZIlayer_row(num=5, start_index=mzi_idx, mzi_kwargs=mzi_kwargs))
         self.mzi_counts.append(5)
-        
+
         self.total_mzis = mzi_idx + 5
         assert self.total_mzis == 50, f"Expected 50 MZIs, got {self.total_mzis}"
 
+        # Hook for capturing optical core computations
+        self.forward_power_hook = None
+        self.hook_enabled = False
+
+    def _collect_mzi_parameters(self):
+        """
+        Collect physical parameters from all 50 MZIs in the mesh.
+        Returns a dict mapping MZI index to its physical parameters.
+        """
+        mzi_params = {}
+        for layer in self.layers:
+            if hasattr(layer, 'MZI'):
+                for mzi in layer.MZI:
+                    if hasattr(mzi, 'index') and mzi.index is not None:
+                        idx = mzi.index
+                        # Get physical parameters
+                        if hasattr(mzi, 'physical_parameters'):
+                            phys = mzi.physical_parameters()
+                            mzi_params[idx] = {
+                                'a': phys['a'].detach().cpu().item(),
+                                'b': phys['b'].detach().cpu().item(),
+                                'delta_r': phys['delta_r'].detach().cpu().item(),
+                                'phi0': phys['phi0'].detach().cpu().item()
+                            }
+                        # Get voltage
+                        if hasattr(mzi, '_voltage'):
+                            if idx in mzi_params:
+                                mzi_params[idx]['voltage'] = mzi._voltage.detach().cpu().item()
+                            else:
+                                mzi_params[idx] = {'voltage': mzi._voltage.detach().cpu().item()}
+        return mzi_params
+
+    def register_forward_power_hook(self, hook_fn):
+        """
+        Register a hook function to be called after each forward_power computation.
+
+        Args:
+            hook_fn: Callable that receives a dict with keys:
+                - 'input_power': numpy array (Batch, 10) - input optical power
+                - 'output_power': numpy array (Batch, 10) - output optical power
+                - 'voltages': numpy array (50,) - voltages applied to all 50 MZIs
+                - 'mzi_physical_parameters': dict - physical parameters of all MZIs
+                - 'batch_size': int - batch size
+
+        Returns:
+            A handle object that can be used to remove the hook via handle.remove()
+        """
+        self.forward_power_hook = hook_fn
+        self.hook_enabled = True
+
+        class HookHandle:
+            def __init__(self, parent):
+                self.parent = parent
+
+            def remove(self):
+                self.parent.forward_power_hook = None
+                self.parent.hook_enabled = False
+
+        return HookHandle(self)
+
     def forward(self, x, voltages):
         """
+        Coherent Forward Pass (Complex Field) - Standard Mode
         x: (Batch, 10) - complex or real input
         voltages: (Batch, 50) or (50,) - control voltages for this pass
         """
-        # Slice the big voltage vector into chunks for each layer
         current_v_idx = 0
-        
         for i, layer in enumerate(self.layers):
             count = self.mzi_counts[i]
-            
             if voltages.dim() == 1:
                 v_chunk = voltages[current_v_idx : current_v_idx + count]
             else:
                 v_chunk = voltages[:, current_v_idx : current_v_idx + count]
-            
             x = layer(x, voltages=v_chunk)
             current_v_idx += count
-            
         return x
 
-class BlockMZILinear(nn.Module):
+    def forward_power(self, x, voltages):
+        """
+        Incoherent Power Forward Pass (Spectral Diversity Mode).
+        Simulates the summation of powers from different wavelengths (comb lines).
+
+        Physics:
+        - Input x is Optical Power (Intensity) >= 0.
+        - The MZI mesh acts as a power transmission matrix T = |S|^2.
+        - Output = T * x.
+        - No coherent interference between inputs.
+
+        x: (Batch, 10) - Real-valued power input
+        voltages: (Batch, 50) or (50,)
+        """
+        current_v_idx = 0
+
+        # Ensure input is float (power)
+        if x.is_complex():
+            x = x.abs().pow(2)
+
+        device = x.device
+
+        # Normalize input to (Batch_Total, 10)
+        original_shape = x.shape
+        if x.dim() == 3:
+            x_flat = x.reshape(-1, original_shape[-1])
+        else:
+            x_flat = x
+
+        batch_size = x_flat.shape[0]
+        current_state = x_flat # (Batch, 10)
+
+        # Prepare voltages for hook (expand to full 50-element vector if needed)
+        if voltages.dim() == 1:
+            voltages_for_hook = voltages.detach().cpu().numpy()
+        else:
+            # For batched voltages, take the first sample as representative
+            voltages_for_hook = voltages[0].detach().cpu().numpy() if batch_size > 0 else voltages.detach().cpu().numpy()
+
+        for i, layer in enumerate(self.layers):
+            count = self.mzi_counts[i]
+            
+            # Get voltages
+            if voltages.dim() == 1:
+                v_chunk = voltages[current_v_idx : current_v_idx + count] 
+            else:
+                v_chunk = voltages[:, current_v_idx : current_v_idx + count]
+                # Handle broadcasting if needed
+                if v_chunk.shape[0] != batch_size:
+                    if v_chunk.shape[0] == 1:
+                        v_chunk = v_chunk.expand(batch_size, -1)
+                    elif batch_size % v_chunk.shape[0] == 0:
+                        ratio = batch_size // v_chunk.shape[0]
+                        v_chunk = v_chunk.repeat_interleave(ratio, dim=0)
+            
+            # 1. Get Coherent S-Matrix (Complex)
+            # layer._build_transfer_matrix returns (2N, 2N) or (Batch, 2N, 2N)
+            s_matrix = layer._build_transfer_matrix(device, voltage_overrides=v_chunk)
+            
+            # 2. Convert to Power Transmission Matrix T = |S|^2
+            t_matrix = s_matrix.abs().pow(2) # Real, positive
+            
+            # 3. Apply T to current_state
+            # Map input x to the correct input ports of the matrix
+            # MZIlayer input ports are usually 0..N-1
+            full_state = torch.zeros(batch_size, layer.matrix_size, device=device, dtype=t_matrix.dtype)
+            
+            # Use layer.num_ports / 2 for input count? 
+            # MZIlayer_row(num=5) -> 10 ports total. Input is 10? 
+            # In Clement mesh, we usually propagate 10 modes.
+            input_dim = current_state.shape[1]
+            full_state[:, :input_dim] = current_state
+            
+            # Multiply: new_state = full_state @ T.T
+            if t_matrix.dim() == 3:
+                new_state = torch.bmm(full_state.unsqueeze(1), t_matrix.transpose(-2, -1)).squeeze(1)
+            else:
+                new_state = torch.matmul(full_state, t_matrix.T)
+                
+            # Extract Output (Shifted by input_dim usually)
+            # In MZIlayer implementation: output_flat = new_states[:, self.num_ports : self.num_ports + num_ports]
+            # Here layer.num_ports seems to refer to 'num inputs' in the code's context? 
+            # Let's check `MZIlayer_row`: num_ports = num*2 (e.g. 10). matrix_size = 20.
+            # Inputs at 0..9. Outputs at 10..19.
+            out_start = layer.num_ports
+            out_end = layer.num_ports + layer.num_ports # Wait, MZIlayer_row.num_ports is 10.
+            # In `forward`: `output_flat = new_states[:, self.num_ports : self.num_ports + num_ports]`
+            # So yes, it extracts indices 10 to 19.
+            
+            # Wait, `num_ports` in MZIlayer_column is 2*(num+1) = 10 for num=4.
+            # So `layer.num_ports` is reliable for the input/output dimension.
+            
+            current_state = new_state[:, layer.num_ports : layer.num_ports + input_dim]
+            current_v_idx += count
+
+        # Call hook if enabled
+        if self.hook_enabled and self.forward_power_hook is not None:
+            # Collect physical parameters from all 50 MZIs
+            mzi_physical_params = self._collect_mzi_parameters()
+
+            hook_data = {
+                'input_power': x_flat.detach().cpu().numpy(),  # (Batch, 10)
+                'output_power': current_state.detach().cpu().numpy(),  # (Batch, 10)
+                'voltages': voltages_for_hook,  # (50,)
+                'mzi_physical_parameters': mzi_physical_params,  # Dict with all MZI params
+                'batch_size': batch_size
+            }
+            self.forward_power_hook(hook_data)
+
+        if x.dim() == 3:
+            return current_state.view(original_shape)
+        return current_state
+
+
+class OpticalConv2d(nn.Module):
     """
-    A logical linear layer that breaks down large matrix multiplication (e.g., 20x20)
-    into 10x10 blocks to be executed on the OpticalCore10x10.
+    Optical Convolution Layer using Incoherent Power Superposition (Spectral Diversity).
+    
+    Physics:
+    - Inputs are encoded on different wavelengths (comb lines) corresponding to spatial kernel positions.
+    - These pass through the MZI mesh simultaneously without interference.
+    - The MZI mesh applies weights (attenuation/splitting).
+    - The detector sums the power of all wavelengths: y = Sum(T_i * P_i).
+    - To achieve negative weights, we use differential signaling:
+      y = Core(x, V_pos) - Core(x, V_neg).
     """
-    def __init__(self, in_features, out_features, optical_core):
+    def __init__(self, in_channels, out_channels, kernel_size, optical_core, stride=1, padding=0):
         super().__init__()
-        assert in_features % 10 == 0
-        assert out_features % 10 == 0
-        
-        self.in_features = in_features
-        self.out_features = out_features
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.stride = stride
+        self.padding = padding
         self.optical_core = optical_core
         
-        self.n_row_blocks = in_features // 10
-        self.n_col_blocks = out_features // 10
+        # Calculate Unfolded Input Dimension
+        # Standard Conv: Input (B, C, H, W) -> Unfold -> (B, C*K*K, L)
+        self.input_dim = in_channels * kernel_size * kernel_size
         
-        # Parameters: One set of 50 voltages for EACH 10x10 block
+        # We need to map this large input vector to 10x10 blocks for the core.
+        assert self.input_dim % 10 == 0, f"Input dim {self.input_dim} must be divisible by 10 for 10x10 core."
+        assert out_channels % 10 == 0, f"Out channels {out_channels} must be divisible by 10."
+        
+        self.n_row_blocks = self.input_dim // 10
+        self.n_col_blocks = out_channels // 10
+        
+        # Parameters: Two sets of voltages (Pos, Neg) for differential weighting
         # Shape: (Out_Blocks, In_Blocks, 50)
-        # Initialized with small random values
-        self.voltages = nn.Parameter(
-            torch.randn(self.n_col_blocks, self.n_row_blocks, 50) * 0.1
-        )
+        self.voltages_pos = nn.Parameter(torch.randn(self.n_col_blocks, self.n_row_blocks, 50) * 0.1)
+        self.voltages_neg = nn.Parameter(torch.randn(self.n_col_blocks, self.n_row_blocks, 50) * 0.1)
+        
+        # Bias (Standard digital bias added after detection)
+        self.bias = nn.Parameter(torch.zeros(out_channels))
 
     def forward(self, x):
-        # x shape: (Batch, Seq, In_Features)
-        B, S, D = x.shape
-        assert D == self.in_features
+        # x: (Batch, C, H, W)
+        B, C, H, W = x.shape
         
-        # Reshape to separate blocks: (Batch, Seq, Row_Blocks, 10)
-        x_blocked = x.view(B, S, self.n_row_blocks, 10)
+        # 1. Im2Col (Unfold)
+        # Output: (B, C*K*K, L) where L = H_out * W_out
+        x_unfolded = F.unfold(x, kernel_size=self.kernel_size, stride=self.stride, padding=self.padding)
+        L = x_unfolded.shape[2]
         
-        # We need to accumulate results for each column block
-        # Output shape: (Batch, Seq, Col_Blocks, 10)
-        # But we'll sum in complex domain first if output of core is complex?
-        # The core output is complex. We usually take magnitude at the very end of the logic layer,
-        # but here we are doing linear combination.
-        # Coherent addition (complex addition) is physically valid if using coherent detection,
-        # but hard to implement if we measure magnitude after each pass.
-        # ASSUMPTION: We are simulating a coherent system where we can sum complex fields,
-        # OR we assume this is done digitally (electrical domain accumulation).
-        # We will assume digital accumulation of complex values (Linear operation).
+        # Transpose for block processing: (B, L, Input_Dim)
+        x_inp = x_unfolded.transpose(1, 2) # (B, L, D)
+        
+        # Ensure input is Power (Positive)
+        # Assuming previous layers output power or we rectifying here.
+        x_inp = torch.abs(x_inp) 
+        
+        # Reshape for blocking: (B, L, Row_Blocks, 10)
+        x_blocked = x_inp.view(B, L, self.n_row_blocks, 10)
         
         output_blocks = []
         
+        # 2. Block Matrix Multiplication (Differential)
         for col in range(self.n_col_blocks):
             col_acc = None
             for row in range(self.n_row_blocks):
-                # Get input chunk: (Batch, Seq, 10)
-                x_chunk = x_blocked[:, :, row, :]
+                x_chunk = x_blocked[:, :, row, :] # (B, L, 10)
                 
-                # Get voltage params for this block: (50,)
-                v_params = self.voltages[col, row]
-                
-                # Flatten batch/seq for core processing
-                # Core expects (Total_Batch, 10)
+                # Flatten: (B*L, 10)
                 x_flat = x_chunk.reshape(-1, 10)
                 
-                # Pass through Optical Core
-                # Note: v_params is (50,), it will be broadcasted by core
-                out_flat = self.optical_core(x_flat, v_params)
+                # Get Voltages
+                v_pos = self.voltages_pos[col, row]
+                v_neg = self.voltages_neg[col, row]
+                
+                # Optical Pass (Incoherent Power Mode)
+                # y = T_pos * x - T_neg * x
+                out_pos = self.optical_core.forward_power(x_flat, v_pos)
+                out_neg = self.optical_core.forward_power(x_flat, v_neg)
+                
+                diff_out = out_pos - out_neg
                 
                 # Reshape back
-                out_chunk = out_flat.view(B, S, 10)
+                out_chunk = diff_out.view(B, L, 10)
                 
                 if col_acc is None:
                     col_acc = out_chunk
@@ -143,9 +332,94 @@ class BlockMZILinear(nn.Module):
             
             output_blocks.append(col_acc)
             
-        # Concatenate results: (Batch, Seq, Out_Features)
-        out = torch.cat(output_blocks, dim=2)
+        # 3. Concatenate and Fold
+        # (B, L, Out_Channels)
+        out_cat = torch.cat(output_blocks, dim=2)
+        
+        # Add bias
+        out_cat = out_cat + self.bias
+        
+        # Transpose back: (B, Out_Channels, L)
+        out_trans = out_cat.transpose(1, 2)
+        
+        # Calculate Output Height/Width
+        H_out = int((H + 2*self.padding - 1*(self.kernel_size-1) - 1)/self.stride + 1)
+        W_out = int((W + 2*self.padding - 1*(self.kernel_size-1) - 1)/self.stride + 1)
+        
+        out = out_trans.view(B, self.out_channels, H_out, W_out)
+        
         return out
+
+
+class ConvFFN(nn.Module):
+    """
+    Convolutional Feed-Forward Network replacing the standard MLP.
+    Based on 'Less-Attention' principles and Optical Convolution.
+    Structure: Conv2d (3x3) -> GELU -> Conv2d (1x1)
+    """
+    def __init__(self, dim, hidden_dim, optical_core, drop=0.0):
+        super().__init__()
+        # Ensure dims are compatible with 10x10 core
+        hidden_dim = math.ceil(hidden_dim / 10) * 10
+        dim = math.ceil(dim / 10) * 10 
+        
+        # Layer 1: 3x3 Conv (Spatial + Channel Mixing)
+        self.conv1 = OpticalConv2d(dim, hidden_dim, kernel_size=3, padding=1, optical_core=optical_core)
+        self.act = nn.GELU()
+        self.drop1 = nn.Dropout(drop)
+        
+        # Layer 2: 1x1 Conv (Projection)
+        self.conv2 = OpticalConv2d(hidden_dim, dim, kernel_size=1, padding=0, optical_core=optical_core)
+        self.drop2 = nn.Dropout(drop)
+
+    def forward(self, x):
+        # x input to Block is usually (B, Seq, Dim).
+        # We need (B, Dim, H, W) for Conv2d.
+        B, S, D = x.shape
+        
+        # Handle CLS Token (Seq Length = Patches + 1)
+        # We assume the first token is CLS.
+        num_patches = S - 1
+        H = W = int(math.sqrt(num_patches))
+        
+        if H * W != num_patches:
+             # Fallback if no CLS token or unexpected shape
+             # Try assuming no CLS
+             H = W = int(math.sqrt(S))
+             if H * W == S:
+                 # No CLS token case
+                 patches = x
+                 cls_token = None
+             else:
+                 raise ValueError(f"Sequence length {S} incompatible with square image + optional CLS.")
+        else:
+             # Standard ViT case
+             cls_token = x[:, 0:1, :]
+             patches = x[:, 1:, :]
+        
+        # Reshape Patches: (B, N, D) -> (B, D, H, W)
+        patches = patches.transpose(1, 2).view(B, D, H, W)
+        
+        # Apply Optical Convolutions
+        patches = self.conv1(patches)
+        patches = self.act(patches)
+        patches = self.drop1(patches)
+        
+        patches = self.conv2(patches)
+        patches = self.drop2(patches)
+        
+        # Reshape back: (B, D, H, W) -> (B, N, D)
+        patches = patches.flatten(2).transpose(1, 2)
+        
+        # Recombine
+        if cls_token is not None:
+            # We treat CLS as Identity in FFN (bypass)
+            x = torch.cat([cls_token, patches], dim=1)
+        else:
+            x = patches
+            
+        return x
+
 
 class PatchEmbed(nn.Module):
     def __init__(self, img_size=28, patch_size=4, in_chans=1, embed_dim=20):
@@ -159,30 +433,6 @@ class PatchEmbed(nn.Module):
         x = x.flatten(2).transpose(1, 2)
         return x
 
-class MLP(nn.Module):
-    def __init__(self, dim, optical_core, mlp_ratio=4.0, drop=0.0):
-        super().__init__()
-        hidden_dim = int(dim * mlp_ratio)
-        
-        # Ensure hidden dims are multiples of 10
-        hidden_dim = math.ceil(hidden_dim / 10) * 10
-        
-        self.fc1 = BlockMZILinear(dim, hidden_dim, optical_core)
-        self.fc2 = BlockMZILinear(hidden_dim, dim, optical_core)
-        self.drop = nn.Dropout(drop)
-
-    def forward(self, x):
-        # FC1
-        x = self.fc1(x)
-        x = torch.abs(x) # Detection / Activation
-        x = F.gelu(x)
-        x = self.drop(x)
-        
-        # FC2
-        x = self.fc2(x)
-        x = torch.abs(x) # Detection
-        x = self.drop(x)
-        return x
 
 class Block(nn.Module):
     def __init__(self, dim, num_heads, optical_core, mlp_ratio=4.0, attn_drop=0.0, drop=0.0, drop_path=0.0):
@@ -191,14 +441,19 @@ class Block(nn.Module):
         self.attn = nn.MultiheadAttention(embed_dim=dim, num_heads=num_heads, dropout=attn_drop, batch_first=True)
         self.drop_path = StochasticDepth(drop_path) if drop_path > 0 else nn.Identity()
         self.norm2 = nn.LayerNorm(dim)
-        self.mlp = MLP(dim, optical_core, mlp_ratio, drop)
+        
+        # Use ConvFFN instead of MLP
+        hidden_dim = int(dim * mlp_ratio)
+        self.mlp = ConvFFN(dim, hidden_dim, optical_core, drop)
 
     def forward(self, x):
-        # MHSA (Standard Digital Attention for now)
+        # MHSA (Standard Digital Attention)
         x = x + self.drop_path(self.attn(self.norm1(x), self.norm1(x), self.norm1(x), need_weights=False)[0])
-        # MLP with Block-based Optical Processing
+        
+        # ConvFFN (Optical Convolution)
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
+
 
 class StochasticDepth(nn.Module):
     def __init__(self, drop_prob):
@@ -212,6 +467,7 @@ class StochasticDepth(nn.Module):
         shape = (x.shape[0],) + (1,) * (x.ndim - 1)
         mask = x.new_empty(shape).bernoulli_(keep_prob).div(keep_prob)
         return x * mask
+
 
 class ViT(nn.Module):
     def __init__(
@@ -313,9 +569,6 @@ def load_mzi_parameters(model, json_path="results/mzi_parameters.json"):
                 )
                 module.freeze_fabrication_parameters()
                 count += 1
-            else:
-                 # Indices not in JSON are left as ideal (or whatever they were initialized as)
-                 pass
     print(f"Applied calibrated parameters to {count} MZI instances.")
 
 def set_seed(seed):
@@ -346,73 +599,32 @@ def get_loaders(cfg: CFG, root="./data"):
                               num_workers=cfg.num_workers, pin_memory=True)
     return train_loader, test_loader
 
-def get_mzi_cache_stats(model):
-    """Collect cache statistics from all MZI layers"""
-    total_hits = 0
-    total_misses = 0
-
-    def collect_stats(module):
-        nonlocal total_hits, total_misses
-        if hasattr(module, 'get_cache_stats'):
-            stats = module.get_cache_stats()
-            # Assuming stats might return None if not implemented or initialized
-            if stats: 
-                total_hits += stats.get('cache_hits', 0)
-                total_misses += stats.get('cache_misses', 0)
-        
-        # Helper for MZIlayer_row/col which don't expose get_cache_stats directly but have internal cache logic
-        # Actually, looking at the code, they don't seem to expose a counter, just logic.
-        # We might need to skip this or implement it if it was there.
-        # For now, let's just recurse.
-        
-        for child in module.children():
-            collect_stats(child)
-
-    collect_stats(model)
-    
-    # Since we can't easily get stats from current MZI implementation without modifying it, 
-    # we'll return placeholders or 0 to avoid errors.
-    # The previous implementation of get_mzi_cache_stats relied on methods that might not exist 
-    # in the standard nn.Module or the provided MZI classes.
-    # If the MZI classes don't have get_cache_stats, this will just return 0s.
-
-    total = total_hits + total_misses
-    hit_rate = total_hits / total if total > 0 else 0
-
-    return {
-        'total_hits': total_hits,
-        'total_misses': total_misses,
-        'hit_rate': hit_rate
-    }
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--epochs", type=int, default=CFG.epochs)
     parser.add_argument("--bs", type=int, default=CFG.batch_size)
     parser.add_argument("--lr", type=float, default=CFG.lr)
     parser.add_argument("--no-amp", action="store_true")
+    parser.add_argument("--depth", type=int, default=CFG.depth)
     args = parser.parse_args()
 
-    cfg = CFG(epochs=args.epochs, batch_size=args.bs, lr=args.lr, amp=not args.no_amp)
+    cfg = CFG(epochs=args.epochs, batch_size=args.bs, lr=args.lr, amp=not args.no_amp, depth=args.depth)
     set_seed(cfg.seed)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     train_loader, test_loader = get_loaders(cfg)
 
+    # Initialize model with ConvFFN (Optical Convolution)
     model = ViT(
         img_size=cfg.img_size, patch_size=cfg.patch, in_chans=1, num_classes=10,
         embed_dim=cfg.embed, depth=cfg.depth, num_heads=cfg.heads,
         mlp_ratio=4.0, drop_rate=0.0, attn_drop_rate=0.0, drop_path_rate=0.1
     ).to(device)
 
-    # Load calibrated hardware parameters
-    # Note: load_mzi_parameters iterates over modules. 
-    # Our OpticalCore10x10 contains the MZI layers with indices 0-49.
-    # So this should work perfectly.
     load_mzi_parameters(model, json_path="results/mzi_parameters.json")
 
     total_params = sum(p.numel() for p in model.parameters())
-    print("=== OPTIMIZED MZI ViT Model ===")
+    print("=== OPTIMIZED OPTICAL CONVOLUTION ViT Model ===")
     print(f"Device: {device}")
     print(f"Total parameters: {total_params:,}")
     print(f"Batch size: {cfg.batch_size}")
@@ -428,7 +640,7 @@ def main():
     best_acc = 0.0
     step = 0
 
-    print("Starting training with OPTIMIZED MZI implementation...")
+    print("Starting training with OPTICAL CONVOLUTION layers...")
     print()
 
     for epoch in range(cfg.epochs):
@@ -454,7 +666,6 @@ def main():
             num_batches += 1
             step += 1
 
-            # Print progress every 50 batches
             if batch_idx % 50 == 0:
                 print(f"  Batch {batch_idx:3d}/{len(train_loader):3d}, "
                       f"Loss: {loss.item():.4f}, "
@@ -478,117 +689,23 @@ def main():
         eval_time = time.time() - eval_start
         avg_loss = epoch_loss / num_batches
 
-        # Get MZI cache statistics
-        cache_stats = get_mzi_cache_stats(model)
-
         print(f"Epoch {epoch+1:02d}/{cfg.epochs} | "
               f"Loss: {avg_loss:.4f} | "
               f"Acc: {acc*100:.2f}% | "
               f"Time: {epoch_time:.1f}s | "
-              f"Eval: {eval_time:.1f}s | "
-              f"Cache: {cache_stats['hit_rate']:.3f}")
+              f"Eval: {eval_time:.1f}s")
 
         if acc > best_acc:
             best_acc = acc
-            torch.save({"model": model.state_dict()}, "mnist_vit_optimized_best.pt")
+            torch.save({"model": model.state_dict()}, "mnist_vit_optical_conv_best.pt")
             print(f"  -> New best accuracy: {best_acc*100:.2f}%")
 
         print()
 
     print(f"Training completed!")
     print(f"Best validation accuracy: {best_acc*100:.2f}%")
-
-    # Final statistics
-    final_cache_stats = get_mzi_cache_stats(model)
-    print(f"Final cache statistics:")
-    print(f"  Total cache hits: {final_cache_stats['total_hits']:,}")
-    print(f"  Total cache misses: {final_cache_stats['total_misses']:,}")
-    print(f"  Final cache hit rate: {final_cache_stats['hit_rate']:.3f}")
     
-    # ---------------------------------------------------------
-    # Collect Hardware Verification Data
-    # ---------------------------------------------------------
-    print("\nStarting hardware data collection...")
-    collect_hardware_data(model, test_loader, device)
-
-def collect_hardware_data(model, dataloader, device, save_dir="hardware_data"):
-    import os
-    import numpy as np
-    
-    os.makedirs(save_dir, exist_ok=True)
-    model.eval()
-    
-    # Storage for collected data
-    # Structure: List of dicts, where each dict is one 'pass' through the optical core
-    collected_records = []
-    
-    # Define the hook function
-    def core_hook(module, input_args, output):
-        # input_args is (x, voltages)
-        # x: (Batch, 10)
-        # voltages: (Batch, 50) or (50,)
-        # output: (Batch, 10)
-        
-        x_in = input_args[0].detach().cpu().numpy()
-        voltages = input_args[1].detach().cpu().numpy()
-        output_out = output.detach().cpu().numpy()
-        
-        # If voltages is 1D (shared across batch), repeat it for consistency if needed
-        # Or just store it as is. Let's store as is to save space if it's constant.
-        
-        record = {
-            "input_optical_state": x_in,     # (Batch, 10)
-            "mzi_voltages": voltages,        # (Batch, 50) or (50,)
-            "output_optical_state": output_out # (Batch, 10)
-        }
-        collected_records.append(record)
-
-    # Register hook on the optical core
-    # Access the core directly from the model
-    if hasattr(model, 'optical_core'):
-        handle = model.optical_core.register_forward_hook(core_hook)
-    else:
-        print("Error: Model does not have 'optical_core' attribute. Cannot collect data.")
-        return
-
-    print("Hook registered. Running inference on a single batch...")
-    
-    # Run inference on just one batch to avoid massive data files
-    try:
-        data_iter = iter(dataloader)
-        x_batch, _ = next(data_iter)
-        x_batch = x_batch.to(device)
-        
-        with torch.no_grad():
-            _ = model(x_batch)
-            
-    except StopIteration:
-        print("Error: Dataloader is empty.")
-    except Exception as e:
-        print(f"Error during collection inference: {e}")
-    finally:
-        handle.remove()
-        print("Hook removed.")
-
-    # Save to file
-    if collected_records:
-        save_path = os.path.join(save_dir, 'vit_hardware_verification.npy')
-        
-        # We also want to know which record corresponds to which logical layer.
-        # Since the execution order is deterministic (FC1 block 0,0 -> 0,1... -> FC2...), 
-        # we can reconstruct the mapping if we know the architecture.
-        # For now, we save the raw sequence of operations.
-        
-        data_to_save = {
-            "records": collected_records,
-            "description": "Sequential records of every call to OpticalCore10x10.forward(x, v)."
-        }
-        
-        np.save(save_path, data_to_save)
-        print(f"Collected {len(collected_records)} hardware passes.")
-        print(f"Data saved to: {save_path}")
-    else:
-        print("Warning: No data was collected.")
+    # Optional: Add hardware data collection if needed (omitted for brevity unless requested)
 
 if __name__ == "__main__":
     main()
