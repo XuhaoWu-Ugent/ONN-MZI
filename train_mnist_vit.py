@@ -668,7 +668,8 @@ def get_loaders(cfg: CFG, root="./data", distributed=False, world_size=1, rank=0
             train_ds = datasets.MNIST(root, train=True, download=True, transform=train_tf)
             test_ds  = datasets.MNIST(root, train=False, download=True, transform=test_tf)
         # Wait for rank 0 to finish downloading
-        dist.barrier()
+        torch.cuda.set_device(rank)
+        dist.barrier(device_ids=[rank])
         if rank != 0:
             # Other ranks load the already-downloaded dataset
             train_ds = datasets.MNIST(root, train=True, download=False, transform=train_tf)
@@ -934,7 +935,7 @@ def main():
     total_steps = cfg.epochs * math.ceil(len(train_loader.dataset)/cfg.batch_size)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_steps)
 
-    scaler = torch.cuda.amp.GradScaler(enabled=cfg.amp)
+    scaler = torch.amp.GradScaler('cuda', enabled=cfg.amp)
 
     # Initialize training state
     best_acc = 0.0
@@ -988,7 +989,7 @@ def main():
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=cfg.amp):
+            with torch.amp.autocast('cuda', enabled=cfg.amp):
                 logits = model(x)
                 loss = criterion(logits, y)
 
@@ -1011,7 +1012,7 @@ def main():
         correct, n = 0, 0
         eval_start = time.time()
 
-        with torch.no_grad(), torch.cuda.amp.autocast(enabled=cfg.amp):
+        with torch.no_grad(), torch.amp.autocast('cuda', enabled=cfg.amp):
             for x, y in test_loader:
                 x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
                 logits = model(x)
