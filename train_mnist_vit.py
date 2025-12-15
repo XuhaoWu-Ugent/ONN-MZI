@@ -863,6 +863,14 @@ def main():
     # Set device
     if torch.cuda.is_available():
         if distributed:
+            # Check GPU availability
+            num_gpus = torch.cuda.device_count()
+            if local_rank >= num_gpus:
+                raise RuntimeError(
+                    f"local_rank={local_rank} but only {num_gpus} GPUs available. "
+                    f"torchrun requested {world_size} processes but SLURM only allocated {num_gpus} GPUs. "
+                    f"Fix: Use --gpus-per-node={world_size} or --gres=gpu:v100:{world_size} in SLURM script."
+                )
             torch.cuda.set_device(local_rank)
             device = torch.device(f"cuda:{local_rank}")
         else:
@@ -1045,21 +1053,23 @@ def main():
             batch_time = time.time() - batch_start
             batch_times.append(batch_time)
 
-            if batch_idx % 50 == 0 and is_main:
+            if batch_idx % 10 == 0 and is_main:
                 # Memory stats
+                mem_str = ""
                 if torch.cuda.is_available():
-                    mem_allocated = torch.cuda.memory_allocated(device) / 1024**3
-                    mem_reserved = torch.cuda.memory_reserved(device) / 1024**3
-                    mem_str = f"Mem: {mem_allocated:.1f}/{mem_reserved:.1f}GB"
-                else:
-                    mem_str = ""
+                    try:
+                        mem_allocated = torch.cuda.memory_allocated(device) / 1024**3
+                        mem_reserved = torch.cuda.memory_reserved(device) / 1024**3
+                        mem_str = f"Mem: {mem_allocated:.1f}/{mem_reserved:.1f}GB"
+                    except Exception as e:
+                        mem_str = f"Mem: Error ({e})"
 
-                avg_batch_time = sum(batch_times[-50:]) / min(len(batch_times), 50)
+                avg_batch_time = sum(batch_times[-10:]) / min(len(batch_times), 10)
                 print(f"  Batch {batch_idx:3d}/{len(train_loader):3d}, "
                       f"Loss: {loss.item():.4f}, "
                       f"LR: {optimizer.param_groups[0]['lr']:.6f}, "
                       f"Time: {avg_batch_time:.2f}s/batch, "
-                      f"{mem_str}")
+                      f"{mem_str}", flush=True)
 
         # Evaluation
         model.eval()
