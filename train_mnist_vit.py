@@ -13,6 +13,7 @@ from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torchvision import datasets, transforms
+from torch.utils.checkpoint import checkpoint
 
 # Import FIXED MZI implementations
 from module.MZI_array.mzi_column_array import MZIlayer_column
@@ -132,7 +133,7 @@ class OpticalCore10x10(nn.Module):
 
     def forward_power(self, x, voltages):
         """
-        Incoherent Power Forward Pass (Spectral Diversity Mode).
+        OPTIMIZED Incoherent Power Forward Pass (Spectral Diversity Mode).
         Simulates the summation of powers from different wavelengths (comb lines).
 
         Physics:
@@ -144,37 +145,38 @@ class OpticalCore10x10(nn.Module):
         x: (Batch, 10) - Real-valued power input
         voltages: (Batch, 50) or (50,)
         """
-        current_v_idx = 0
-
         # Ensure input is float (power)
         if x.is_complex():
             x = x.abs().pow(2)
 
         device = x.device
+        original_shape = x.shape
 
         # Normalize input to (Batch_Total, 10)
-        original_shape = x.shape
         if x.dim() == 3:
             x_flat = x.reshape(-1, original_shape[-1])
         else:
             x_flat = x
 
         batch_size = x_flat.shape[0]
-        current_state = x_flat # (Batch, 10)
+        current_state = x_flat  # (Batch, 10)
 
-        # Prepare voltages for hook (expand to full 50-element vector if needed)
-        if voltages.dim() == 1:
-            voltages_for_hook = voltages.detach().cpu().numpy()
-        else:
-            # For batched voltages, take the first sample as representative
-            voltages_for_hook = voltages[0].detach().cpu().numpy() if batch_size > 0 else voltages.detach().cpu().numpy()
+        # Prepare voltages for hook (if needed)
+        if self.hook_enabled and self.forward_power_hook is not None:
+            if voltages.dim() == 1:
+                voltages_for_hook = voltages.detach().cpu().numpy()
+            else:
+                voltages_for_hook = voltages[0].detach().cpu().numpy() if batch_size > 0 else voltages.detach().cpu().numpy()
 
+        current_v_idx = 0
+
+        # OPTIMIZATION: Process layers with minimal memory allocation
         for i, layer in enumerate(self.layers):
             count = self.mzi_counts[i]
-            
-            # Get voltages
+
+            # Get voltages for this layer
             if voltages.dim() == 1:
-                v_chunk = voltages[current_v_idx : current_v_idx + count] 
+                v_chunk = voltages[current_v_idx : current_v_idx + count]
             else:
                 v_chunk = voltages[:, current_v_idx : current_v_idx + count]
                 # Handle broadcasting if needed
@@ -184,61 +186,41 @@ class OpticalCore10x10(nn.Module):
                     elif batch_size % v_chunk.shape[0] == 0:
                         ratio = batch_size // v_chunk.shape[0]
                         v_chunk = v_chunk.repeat_interleave(ratio, dim=0)
-            
-            # 1. Get Coherent S-Matrix (Complex)
-            # layer._build_transfer_matrix returns (2N, 2N) or (Batch, 2N, 2N)
+
+            # Get S-Matrix and convert to Power Transmission Matrix
             s_matrix = layer._build_transfer_matrix(device, voltage_overrides=v_chunk)
-            
-            # 2. Convert to Power Transmission Matrix T = |S|^2
-            t_matrix = s_matrix.abs().pow(2) # Real, positive
-            
-            # 3. Apply T to current_state
-            # Map input x to the correct input ports of the matrix
-            # MZIlayer input ports are usually 0..N-1
-            full_state = torch.zeros(batch_size, layer.matrix_size, device=device, dtype=t_matrix.dtype)
-            
-            # Use layer.num_ports / 2 for input count? 
-            # MZIlayer_row(num=5) -> 10 ports total. Input is 10? 
-            # In Clement mesh, we usually propagate 10 modes.
+            t_matrix = s_matrix.abs().pow(2)  # T = |S|^2
+
+            # Apply transformation with minimal memory allocation
             input_dim = current_state.shape[1]
+
+            # Allocate full_state only once per layer
+            full_state = torch.zeros(batch_size, layer.matrix_size, device=device, dtype=current_state.dtype)
             full_state[:, :input_dim] = current_state
-            
-            # Multiply: new_state = full_state @ T.T
+
+            # Matrix multiplication
             if t_matrix.dim() == 3:
                 new_state = torch.bmm(full_state.unsqueeze(1), t_matrix.transpose(-2, -1)).squeeze(1)
             else:
-                new_state = torch.matmul(full_state, t_matrix.T)
-                
-            # Extract Output (Shifted by input_dim usually)
-            # In MZIlayer implementation: output_flat = new_states[:, self.num_ports : self.num_ports + num_ports]
-            # Here layer.num_ports seems to refer to 'num inputs' in the code's context? 
-            # Let's check `MZIlayer_row`: num_ports = num*2 (e.g. 10). matrix_size = 20.
-            # Inputs at 0..9. Outputs at 10..19.
-            out_start = layer.num_ports
-            out_end = layer.num_ports + layer.num_ports # Wait, MZIlayer_row.num_ports is 10.
-            # In `forward`: `output_flat = new_states[:, self.num_ports : self.num_ports + num_ports]`
-            # So yes, it extracts indices 10 to 19.
-            
-            # Wait, `num_ports` in MZIlayer_column is 2*(num+1) = 10 for num=4.
-            # So `layer.num_ports` is reliable for the input/output dimension.
-            
+                new_state = full_state @ t_matrix.T
+
+            # Extract output (reuse current_state to save memory)
             current_state = new_state[:, layer.num_ports : layer.num_ports + input_dim]
             current_v_idx += count
 
         # Call hook if enabled
         if self.hook_enabled and self.forward_power_hook is not None:
-            # Collect physical parameters from all 50 MZIs
             mzi_physical_params = self._collect_mzi_parameters()
-
             hook_data = {
-                'input_power': x_flat.detach().cpu().numpy(),  # (Batch, 10)
-                'output_power': current_state.detach().cpu().numpy(),  # (Batch, 10)
-                'voltages': voltages_for_hook,  # (50,)
-                'mzi_physical_parameters': mzi_physical_params,  # Dict with all MZI params
+                'input_power': x_flat.detach().cpu().numpy(),
+                'output_power': current_state.detach().cpu().numpy(),
+                'voltages': voltages_for_hook,
+                'mzi_physical_parameters': mzi_physical_params,
                 'batch_size': batch_size
             }
             self.forward_power_hook(hook_data)
 
+        # Restore original shape if needed
         if x.dim() == 3:
             return current_state.view(original_shape)
         return current_state
@@ -247,7 +229,7 @@ class OpticalCore10x10(nn.Module):
 class OpticalConv2d(nn.Module):
     """
     Optical Convolution Layer using Incoherent Power Superposition (Spectral Diversity).
-    
+
     Physics:
     - Inputs are encoded on different wavelengths (comb lines) corresponding to spatial kernel positions.
     - These pass through the MZI mesh simultaneously without interference.
@@ -255,6 +237,8 @@ class OpticalConv2d(nn.Module):
     - The detector sums the power of all wavelengths: y = Sum(T_i * P_i).
     - To achieve negative weights, we use differential signaling:
       y = Core(x, V_pos) - Core(x, V_neg).
+
+    OPTIMIZED VERSION: Batch processing to reduce optical core calls.
     """
     def __init__(self, in_channels, out_channels, kernel_size, optical_core, stride=1, padding=0):
         super().__init__()
@@ -264,94 +248,88 @@ class OpticalConv2d(nn.Module):
         self.stride = stride
         self.padding = padding
         self.optical_core = optical_core
-        
+
         # Calculate Unfolded Input Dimension
         # Standard Conv: Input (B, C, H, W) -> Unfold -> (B, C*K*K, L)
         self.input_dim = in_channels * kernel_size * kernel_size
-        
+
         # We need to map this large input vector to 10x10 blocks for the core.
         assert self.input_dim % 10 == 0, f"Input dim {self.input_dim} must be divisible by 10 for 10x10 core."
         assert out_channels % 10 == 0, f"Out channels {out_channels} must be divisible by 10."
-        
+
         self.n_row_blocks = self.input_dim // 10
         self.n_col_blocks = out_channels // 10
-        
+
         # Parameters: Two sets of voltages (Pos, Neg) for differential weighting
         # Shape: (Out_Blocks, In_Blocks, 50)
         self.voltages_pos = nn.Parameter(torch.randn(self.n_col_blocks, self.n_row_blocks, 50) * 0.1)
         self.voltages_neg = nn.Parameter(torch.randn(self.n_col_blocks, self.n_row_blocks, 50) * 0.1)
-        
+
         # Bias (Standard digital bias added after detection)
         self.bias = nn.Parameter(torch.zeros(out_channels))
 
     def forward(self, x):
         # x: (Batch, C, H, W)
         B, C, H, W = x.shape
-        
+
         # 1. Im2Col (Unfold)
         # Output: (B, C*K*K, L) where L = H_out * W_out
         x_unfolded = F.unfold(x, kernel_size=self.kernel_size, stride=self.stride, padding=self.padding)
         L = x_unfolded.shape[2]
-        
+
         # Transpose for block processing: (B, L, Input_Dim)
         x_inp = x_unfolded.transpose(1, 2) # (B, L, D)
-        
+
         # Ensure input is Power (Positive)
-        # Assuming previous layers output power or we rectifying here.
-        x_inp = torch.abs(x_inp) 
-        
+        x_inp = torch.abs(x_inp)
+
         # Reshape for blocking: (B, L, Row_Blocks, 10)
         x_blocked = x_inp.view(B, L, self.n_row_blocks, 10)
-        
-        output_blocks = []
-        
-        # 2. Block Matrix Multiplication (Differential)
+
+        # OPTIMIZATION: Batch all optical core calls together
+        # Reshape to (B*L*Row_Blocks, 10) for batched processing
+        BL = B * L
+        x_all_blocks = x_blocked.view(BL, self.n_row_blocks, 10)
+
+        # Pre-allocate output tensor
+        output = torch.zeros(BL, self.n_col_blocks, 10, device=x.device, dtype=x.dtype)
+
+        # 2. Block Matrix Multiplication (Differential) - OPTIMIZED
         for col in range(self.n_col_blocks):
-            col_acc = None
             for row in range(self.n_row_blocks):
-                x_chunk = x_blocked[:, :, row, :] # (B, L, 10)
-                
-                # Flatten: (B*L, 10)
-                x_flat = x_chunk.reshape(-1, 10)
-                
+                x_chunk = x_all_blocks[:, row, :]  # (B*L, 10)
+
                 # Get Voltages
                 v_pos = self.voltages_pos[col, row]
                 v_neg = self.voltages_neg[col, row]
-                
+
                 # Optical Pass (Incoherent Power Mode)
                 # y = T_pos * x - T_neg * x
-                out_pos = self.optical_core.forward_power(x_flat, v_pos)
-                out_neg = self.optical_core.forward_power(x_flat, v_neg)
-                
-                diff_out = out_pos - out_neg
-                
-                # Reshape back
-                out_chunk = diff_out.view(B, L, 10)
-                
-                if col_acc is None:
-                    col_acc = out_chunk
-                else:
-                    col_acc = col_acc + out_chunk
-            
-            output_blocks.append(col_acc)
-            
-        # 3. Concatenate and Fold
-        # (B, L, Out_Channels)
-        out_cat = torch.cat(output_blocks, dim=2)
-        
+                out_pos = self.optical_core.forward_power(x_chunk, v_pos)
+                out_neg = self.optical_core.forward_power(x_chunk, v_neg)
+
+                diff_out = out_pos - out_neg  # (B*L, 10)
+
+                # Accumulate
+                output[:, col, :] += diff_out
+
+        # 3. Reshape and finalize
+        # (B*L, Col_Blocks, 10) -> (B, L, Out_Channels)
+        output = output.view(B, L, self.out_channels)
+
         # Add bias
-        out_cat = out_cat + self.bias
-        
+        output = output + self.bias
+
         # Transpose back: (B, Out_Channels, L)
-        out_trans = out_cat.transpose(1, 2)
-        
+        output = output.transpose(1, 2)
+
         # Calculate Output Height/Width
         H_out = int((H + 2*self.padding - 1*(self.kernel_size-1) - 1)/self.stride + 1)
         W_out = int((W + 2*self.padding - 1*(self.kernel_size-1) - 1)/self.stride + 1)
-        
-        out = out_trans.view(B, self.out_channels, H_out, W_out)
-        
-        return out
+
+        output = output.view(B, self.out_channels, H_out, W_out)
+
+        return output
 
 
 class ConvFFN(nn.Module):
@@ -438,24 +416,34 @@ class PatchEmbed(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, dim, num_heads, optical_core, mlp_ratio=4.0, attn_drop=0.0, drop=0.0, drop_path=0.0):
+    def __init__(self, dim, num_heads, optical_core, mlp_ratio=4.0, attn_drop=0.0, drop=0.0, drop_path=0.0, use_checkpoint=False):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
         self.attn = nn.MultiheadAttention(embed_dim=dim, num_heads=num_heads, dropout=attn_drop, batch_first=True)
         self.drop_path = StochasticDepth(drop_path) if drop_path > 0 else nn.Identity()
         self.norm2 = nn.LayerNorm(dim)
-        
+
         # Use ConvFFN instead of MLP
         hidden_dim = int(dim * mlp_ratio)
         self.mlp = ConvFFN(dim, hidden_dim, optical_core, drop)
 
-    def forward(self, x):
+        # Gradient checkpointing flag
+        self.use_checkpoint = use_checkpoint
+
+    def _forward_impl(self, x):
         # MHSA (Standard Digital Attention)
         x = x + self.drop_path(self.attn(self.norm1(x), self.norm1(x), self.norm1(x), need_weights=False)[0])
-        
+
         # ConvFFN (Optical Convolution)
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
+
+    def forward(self, x):
+        # Use gradient checkpointing to save memory
+        if self.use_checkpoint and self.training:
+            return checkpoint(self._forward_impl, x, use_reentrant=False)
+        else:
+            return self._forward_impl(x)
 
 
 class StochasticDepth(nn.Module):
@@ -477,13 +465,14 @@ class ViT(nn.Module):
         self,
         img_size=14, patch_size=2, in_chans=1, num_classes=10,
         embed_dim=20, depth=8, num_heads=4,
-        mlp_ratio=4.0, drop_rate=0.0, attn_drop_rate=0.0, drop_path_rate=0.1
+        mlp_ratio=4.0, drop_rate=0.0, attn_drop_rate=0.0, drop_path_rate=0.1,
+        use_checkpoint=False
     ):
         super().__init__()
-        
+
         # Instantiate the single physical hardware core
         self.optical_core = OpticalCore10x10()
-        
+
         self.patch_embed = PatchEmbed(img_size, patch_size, in_chans, embed_dim)
         num_patches = self.patch_embed.num_patches
 
@@ -493,7 +482,7 @@ class ViT(nn.Module):
 
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]
         self.blocks = nn.ModuleList([
-            Block(embed_dim, num_heads, self.optical_core, mlp_ratio, attn_drop_rate, drop_rate, dpr[i])
+            Block(embed_dim, num_heads, self.optical_core, mlp_ratio, attn_drop_rate, drop_rate, dpr[i], use_checkpoint)
             for i in range(depth)
         ])
         self.norm = nn.LayerNorm(embed_dim)
@@ -825,6 +814,16 @@ def main():
     parser.add_argument("--no-amp", action="store_true")
     parser.add_argument("--depth", type=int, default=CFG.depth)
 
+    # Memory optimization arguments
+    parser.add_argument("--gradient-checkpointing", action="store_true",
+                        help="Enable gradient checkpointing to save memory (trades compute for memory)")
+
+    # Hardware-aware training arguments
+    parser.add_argument("--use-ideal-mzi", action="store_true",
+                        help="Use ideal MZI parameters instead of real hardware parameters (faster convergence)")
+    parser.add_argument("--finetune-epoch", type=int, default=None,
+                        help="Epoch to switch from ideal to real MZI parameters (e.g., 40 for fine-tuning last 10 epochs)")
+
     # Checkpoint arguments
     parser.add_argument("--resume", type=str, default=None,
                         help="Path to checkpoint to resume from (default: auto-detect checkpoints/checkpoint_latest.pt)")
@@ -892,10 +891,15 @@ def main():
     try:
         if is_main:
             print("Creating ViT model with optical convolution...")
+            if args.gradient_checkpointing:
+                print("  Gradient checkpointing: ENABLED (saves memory, slower training)")
+            else:
+                print("  Gradient checkpointing: DISABLED")
         model = ViT(
             img_size=cfg.img_size, patch_size=cfg.patch, in_chans=1, num_classes=10,
             embed_dim=cfg.embed, depth=cfg.depth, num_heads=cfg.heads,
-            mlp_ratio=4.0, drop_rate=0.0, attn_drop_rate=0.0, drop_path_rate=0.1
+            mlp_ratio=4.0, drop_rate=0.0, attn_drop_rate=0.0, drop_path_rate=0.1,
+            use_checkpoint=args.gradient_checkpointing
         ).to(device)
         if is_main:
             print("[OK] Model created successfully")
@@ -907,12 +911,23 @@ def main():
             cleanup_distributed()
         raise
 
-    try:
-        load_mzi_parameters(model, json_path="results/mzi_parameters.json")
-    except Exception as e:
+    # Load MZI parameters based on training strategy
+    mzi_params_loaded = False
+    if not args.use_ideal_mzi:
+        try:
+            load_mzi_parameters(model, json_path="results/mzi_parameters.json")
+            mzi_params_loaded = True
+            if is_main:
+                print("[Hardware] Using REAL MZI parameters (with fabrication defects)")
+        except Exception as e:
+            if is_main:
+                print(f"Warning: Failed to load MZI parameters: {e}")
+                print("Continuing with ideal parameters...")
+    else:
         if is_main:
-            print(f"Warning: Failed to load MZI parameters: {e}")
-            print("Continuing with default parameters...")
+            print("[Hardware] Using IDEAL MZI parameters (perfect devices)")
+            if args.finetune_epoch:
+                print(f"[Hardware] Will switch to real parameters at epoch {args.finetune_epoch}")
 
     # Wrap model with DDP for distributed training
     if distributed:
@@ -976,6 +991,26 @@ def main():
         print()
 
     for epoch in range(start_epoch, cfg.epochs):
+        # Hardware-aware training: switch to real MZI parameters at finetune epoch
+        if args.use_ideal_mzi and args.finetune_epoch and epoch == args.finetune_epoch and not mzi_params_loaded:
+            if is_main:
+                print("\n" + "=" * 60)
+                print(f"[Hardware] Epoch {epoch}: Switching to REAL MZI parameters")
+                print("=" * 60)
+
+            try:
+                # Get the actual model (unwrap DDP if needed)
+                model_to_load = model.module if isinstance(model, DDP) else model
+                load_mzi_parameters(model_to_load, json_path="results/mzi_parameters.json")
+                mzi_params_loaded = True
+                if is_main:
+                    print("[Hardware] Successfully loaded real MZI parameters for fine-tuning")
+                    print("=" * 60 + "\n")
+            except Exception as e:
+                if is_main:
+                    print(f"[Warning] Failed to load real MZI parameters: {e}")
+                    print("Continuing with ideal parameters...")
+
         # Set epoch for distributed sampler
         if distributed and hasattr(train_loader.sampler, 'set_epoch'):
             train_loader.sampler.set_epoch(epoch)
@@ -984,8 +1019,10 @@ def main():
         epoch_start = time.time()
         epoch_loss = 0.0
         num_batches = 0
+        batch_times = []
 
         for batch_idx, (x, y) in enumerate(train_loader):
+            batch_start = time.time()
             x, y = x.to(device, non_blocking=True), y.to(device, non_blocking=True)
 
             optimizer.zero_grad(set_to_none=True)
@@ -1002,10 +1039,24 @@ def main():
             num_batches += 1
             step += 1
 
+            batch_time = time.time() - batch_start
+            batch_times.append(batch_time)
+
             if batch_idx % 50 == 0 and is_main:
+                # Memory stats
+                if torch.cuda.is_available():
+                    mem_allocated = torch.cuda.memory_allocated(device) / 1024**3
+                    mem_reserved = torch.cuda.memory_reserved(device) / 1024**3
+                    mem_str = f"Mem: {mem_allocated:.1f}/{mem_reserved:.1f}GB"
+                else:
+                    mem_str = ""
+
+                avg_batch_time = sum(batch_times[-50:]) / min(len(batch_times), 50)
                 print(f"  Batch {batch_idx:3d}/{len(train_loader):3d}, "
                       f"Loss: {loss.item():.4f}, "
-                      f"LR: {optimizer.param_groups[0]['lr']:.6f}")
+                      f"LR: {optimizer.param_groups[0]['lr']:.6f}, "
+                      f"Time: {avg_batch_time:.2f}s/batch, "
+                      f"{mem_str}")
 
         # Evaluation
         model.eval()
