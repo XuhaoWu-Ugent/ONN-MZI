@@ -222,7 +222,7 @@ class OpticalCore10x10(nn.Module):
 
         # Restore original shape if needed
         if x.dim() == 3:
-            return current_state.view(original_shape)
+            return current_state.reshape(original_shape)
         return current_state
 
 
@@ -284,12 +284,13 @@ class OpticalConv2d(nn.Module):
         x_inp = torch.abs(x_inp)
 
         # Reshape for blocking: (B, L, Row_Blocks, 10)
-        x_blocked = x_inp.view(B, L, self.n_row_blocks, 10)
+        # Use reshape instead of view to handle non-contiguous tensors
+        x_blocked = x_inp.reshape(B, L, self.n_row_blocks, 10)
 
         # OPTIMIZATION: Batch all optical core calls together
         # Reshape to (B*L*Row_Blocks, 10) for batched processing
         BL = B * L
-        x_all_blocks = x_blocked.view(BL, self.n_row_blocks, 10)
+        x_all_blocks = x_blocked.reshape(BL, self.n_row_blocks, 10)
 
         # Pre-allocate output tensor
         output = torch.zeros(BL, self.n_col_blocks, 10, device=x.device, dtype=x.dtype)
@@ -315,7 +316,7 @@ class OpticalConv2d(nn.Module):
 
         # 3. Reshape and finalize
         # (B*L, Col_Blocks, 10) -> (B, L, Out_Channels)
-        output = output.view(B, L, self.out_channels)
+        output = output.reshape(B, L, self.out_channels)
 
         # Add bias
         output = output + self.bias
@@ -327,7 +328,8 @@ class OpticalConv2d(nn.Module):
         H_out = int((H + 2*self.padding - 1*(self.kernel_size-1) - 1)/self.stride + 1)
         W_out = int((W + 2*self.padding - 1*(self.kernel_size-1) - 1)/self.stride + 1)
 
-        output = output.view(B, self.out_channels, H_out, W_out)
+        # Use reshape instead of view after transpose
+        output = output.reshape(B, self.out_channels, H_out, W_out)
 
         return output
 
@@ -379,7 +381,8 @@ class ConvFFN(nn.Module):
              patches = x[:, 1:, :]
         
         # Reshape Patches: (B, N, D) -> (B, D, H, W)
-        patches = patches.transpose(1, 2).view(B, D, H, W)
+        # Use reshape instead of view after transpose
+        patches = patches.transpose(1, 2).reshape(B, D, H, W)
         
         # Apply Optical Convolutions
         patches = self.conv1(patches)
