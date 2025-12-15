@@ -310,6 +310,15 @@ def setup_distributed():
 
     # Set device BEFORE initializing process group to avoid NCCL conflicts
     if torch.cuda.is_available():
+        num_gpus = torch.cuda.device_count()
+        print(f"[Rank {rank}] local_rank={local_rank}, visible_gpus={num_gpus}")
+        
+        if local_rank >= num_gpus:
+             raise RuntimeError(
+                f"Process with local_rank={local_rank} tried to access GPU {local_rank}, "
+                f"but only {num_gpus} GPUs are visible to this process.\n"
+                f"Check CUDA_VISIBLE_DEVICES and SLURM configuration."
+            )
         torch.cuda.set_device(local_rank)
 
     print(f"[Rank {rank}] Detected torchrun environment: world_size={world_size}, local_rank={local_rank}")
