@@ -475,18 +475,18 @@ def save_checkpoint(model, optimizer, scheduler, scaler, epoch, best_acc, patien
         'args': vars(args)
     }
 
-    # Save latest
-    latest_path = os.path.join(args.checkpoint_dir, 'checkpoint_latest.pt')
+    # Save latest (CIFAR-10 specific naming)
+    latest_path = os.path.join(args.checkpoint_dir, 'cifar10_checkpoint_latest.pt')
     torch.save(checkpoint, latest_path)
 
     # Save epoch checkpoint (original logic)
     if epoch % args.save_every == 0:
-        epoch_path = os.path.join(args.checkpoint_dir, f'checkpoint_epoch{epoch}.pt')
+        epoch_path = os.path.join(args.checkpoint_dir, f'cifar10_checkpoint_epoch{epoch}.pt')
         torch.save(checkpoint, epoch_path)
-    
+
     # Save best model if current model is the best
     if is_best:
-        best_path = os.path.join(args.checkpoint_dir, 'checkpoint_best.pt')
+        best_path = os.path.join(args.checkpoint_dir, 'cifar10_checkpoint_best.pt')
         torch.save(checkpoint, best_path)
 
     print(f"[Checkpoint] Saved to {latest_path}")
@@ -499,7 +499,7 @@ def load_checkpoint(model, optimizer, scheduler, scaler, args, rank):
             print("No checkpoint found, starting training from scratch")
         return 0, 0.0, 0 # Return start_epoch, best_acc, patience_counter
 
-    checkpoint_path = args.resume if args.resume else os.path.join(args.checkpoint_dir, 'checkpoint_latest.pt')
+    checkpoint_path = args.resume if args.resume else os.path.join(args.checkpoint_dir, 'cifar10_checkpoint_latest.pt')
 
     if not os.path.exists(checkpoint_path):
         if is_main_process(rank):
