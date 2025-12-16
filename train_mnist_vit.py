@@ -64,9 +64,10 @@ class CFG:
     seed: int = 42
     amp: bool = True
     depth: int = 2  # Number of transformer blocks
-    embed_dim: int = 20  # Must be compatible with optical core (divisible by in_channels)
+    embed_dim: int = 12  # Reduced to match CNN efficiency (12 filters in main.py)
     num_heads: int = 4
-    mlp_ratio: float = 4.0
+    mlp_ratio: float = 1.0  # No expansion for ConvFFN (卷积层不需要4x扩展)
+    # Total filters: 12 × 2 blocks = 24 filters (vs 160 before)
 
 
 # ----------------------------

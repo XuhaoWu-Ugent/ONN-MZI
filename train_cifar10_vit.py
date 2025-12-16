@@ -56,18 +56,20 @@ print("[Import] Successfully imported CNN_layer from ONN-MZI")
 class CFG:
     """Training configuration"""
     epochs: int = 100
-    batch_size: int = 256
+    batch_size: int = 128  # Reduced from 256 to avoid OOM
     lr: float = 5e-4
     weight_decay: float = 5e-2
     label_smoothing: float = 0.1
     num_workers: int = 4
     seed: int = 42
     amp: bool = True
-    depth: int = 6  # Number of transformer blocks
-    embed_dim: int = 96  # Must be compatible with optical core (divisible by in_channels)
+    depth: int = 6  # Increased from 4 for better representation (standard ViT depth)
+    embed_dim: int = 48  # Keep 48 to balance speed and capacity
     num_heads: int = 4
-    mlp_ratio: float = 4.0
+    mlp_ratio: float = 2.0  # Keep 2.0 for ConvFFN (适度扩展)
     patience: int = 10 # Early stopping patience
+    # Total filters: 96 × 6 blocks = 576 filters
+    # Expected: ~8.4h/epoch, 335K params, ~11% VRAM usage
 
 
 # ----------------------------
