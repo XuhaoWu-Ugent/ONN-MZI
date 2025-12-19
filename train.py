@@ -53,7 +53,10 @@ def test(model, device, test_loader, rank=0):
         correct = int(correct_tensor.item())
 
         # Calculate global metrics
-        total_samples = len(test_loader.dataset) * dist.get_world_size()
+        # Note: test_loader.dataset is the full dataset (10000 for MNIST)
+        # Each process already processed its subset via DistributedSampler
+        # So we just divide by the full dataset size, not multiplied by world_size
+        total_samples = len(test_loader.dataset)
         test_loss /= total_samples
         accuracy = 100. * correct / total_samples
     else:
@@ -64,7 +67,7 @@ def test(model, device, test_loader, rank=0):
     # Only print from rank 0
     if rank == 0:
         print(f'\nTest set: Average loss: {test_loss:.4f}, '
-              f'Accuracy: {correct}/{len(test_loader.dataset) * (dist.get_world_size() if dist.is_initialized() else 1)} ({accuracy:.2f}%)\n')
+              f'Accuracy: {correct}/{len(test_loader.dataset)} ({accuracy:.2f}%)\n')
 
     return test_loss, accuracy
 
@@ -131,8 +134,17 @@ def train(model, device, train_loader, optimizer, epoch, scaler, args,
                 })
 
             # Print training progress
+            # Calculate correct dataset size for this process
+            if dist.is_initialized() and hasattr(train_loader, 'sampler'):
+                # Distributed training: show size of this process's subset
+                # DistributedSampler divides dataset among processes
+                dataset_size = len(train_loader.sampler)  # 60000 / 4 = 15000
+            else:
+                # Single GPU: show full dataset size
+                dataset_size = len(train_loader.dataset)  # 60000
+
             print(f'Train Epoch: {epoch} '
-                  f'[{batch_idx * len(data)}/{len(train_loader.dataset)} '
+                  f'[{batch_idx * len(data)}/{dataset_size} '
                   f'({100. * batch_idx / len(train_loader):.0f}%)]\t'
                   f'Loss: {loss_value:.6f}\t'
                   f'Accuracy: {accuracy:.2f}%')
