@@ -1,5 +1,6 @@
 import torch
 import torch.nn.functional as F
+import torch.distributed as dist
 import wandb
 from torch.amp import autocast
 from torch.cuda.amp import GradScaler
@@ -7,7 +8,7 @@ import json
 import os
 
 
-def test(model, device, test_loader):
+def test(model, device, test_loader, rank=0):
     """
     Evaluate model performance on test dataset
 
@@ -38,18 +39,37 @@ def test(model, device, test_loader):
             pred = output.argmax(dim=1, keepdim=True)
             correct += pred.eq(target.view_as(pred)).sum().item()
 
-    # Average loss and accuracy
-    test_loss /= len(test_loader.dataset)
-    accuracy = 100. * correct / len(test_loader.dataset)
+    # Aggregate results across all processes in distributed training
+    if dist.is_initialized():
+        # Convert to tensors for all_reduce
+        test_loss_tensor = torch.tensor([test_loss], device=device)
+        correct_tensor = torch.tensor([correct], device=device)
 
-    # Print results
-    print(f'\nTest set: Average loss: {test_loss:.4f}, '
-          f'Accuracy: {correct}/{len(test_loader.dataset)} ({accuracy:.2f}%)\n')
+        # Sum across all processes
+        dist.all_reduce(test_loss_tensor, op=dist.ReduceOp.SUM)
+        dist.all_reduce(correct_tensor, op=dist.ReduceOp.SUM)
+
+        test_loss = test_loss_tensor.item()
+        correct = int(correct_tensor.item())
+
+        # Calculate global metrics
+        total_samples = len(test_loader.dataset) * dist.get_world_size()
+        test_loss /= total_samples
+        accuracy = 100. * correct / total_samples
+    else:
+        # Single GPU or CPU training
+        test_loss /= len(test_loader.dataset)
+        accuracy = 100. * correct / len(test_loader.dataset)
+
+    # Only print from rank 0
+    if rank == 0:
+        print(f'\nTest set: Average loss: {test_loss:.4f}, '
+              f'Accuracy: {correct}/{len(test_loader.dataset) * (dist.get_world_size() if dist.is_initialized() else 1)} ({accuracy:.2f}%)\n')
 
     return test_loss, accuracy
 
-def train(model, device, train_loader, optimizer, epoch, scaler, args, 
-          clip_value=1.0, log_interval=5, scheduler=None):
+def train(model, device, train_loader, optimizer, epoch, scaler, args,
+          clip_value=1.0, log_interval=5, scheduler=None, rank=0):
     """
     Train the model for one epoch
     """
@@ -91,8 +111,8 @@ def train(model, device, train_loader, optimizer, epoch, scaler, args,
         epoch_correct += pred.eq(target.view_as(pred)).sum().item()
         total_samples += len(data)
 
-        # Log training progress every 5 batches
-        if batch_idx % log_interval == 0:
+        # Log training progress every 5 batches (only from rank 0)
+        if batch_idx % log_interval == 0 and rank == 0:
             # Calculate batch accuracy
             correct = pred.eq(target.view_as(pred)).sum().item()
             accuracy = 100. * correct / len(data)
