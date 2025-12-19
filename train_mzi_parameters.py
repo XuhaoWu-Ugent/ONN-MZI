@@ -84,7 +84,8 @@ class MZIArray(nn.Module):
         self.port_count = row_mzis * 2
         self.layers = nn.ModuleList()
         next_index = 0
-        mzi_kwargs = {}
+        # Enable training of fabrication parameters, disable internal voltage training
+        mzi_kwargs = {"trainable_fabrication": True, "trainable_voltage": False}
         for row_id in range(row_layers):
             row_layer = MZIlayer_row(
                 num=row_mzis,

@@ -82,6 +82,9 @@ class SingleChannelFilter(nn.Module):
         # Trainable diagonal weight matrix
         self.diagonal_matrix = nn.Parameter(torch.randn(self.num_ports))
 
+        # Trainable Bias (Applied in electrical domain, used as thresholding)
+        self.bias = nn.Parameter(torch.zeros(1))
+
         # Other parameters
         self.flag = 0
         self.timing_stats = {'allocation': 0, 'computation': 0, 'total': 0}
@@ -442,6 +445,11 @@ class SingleChannelFilter(nn.Module):
 
         # Sum across all output ports and reshape to spatial dimensions
         output = weighted_output.sum(dim=2).view(batch_size, output_height, output_width)
+
+        # Add Bias and apply ReLU (Thresholding logic)
+        # Allows noise suppression (negative bias) or base level injection (positive bias)
+        # ReLU ensures non-negative power for the next optical stage
+        output = F.relu(output + self.bias)
 
         # Return based on parameters
         if return_intermediate:

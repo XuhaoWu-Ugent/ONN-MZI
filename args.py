@@ -43,6 +43,10 @@ def get_args():
                            help='Number of MZIs per row in MZI array')
     mzi_group.add_argument('--mzi-column-num', type=int, default=4,
                            help='Number of MZIs per column in MZI array')
+    mzi_group.add_argument('--lossless-mzi', action='store_true', default=True,
+                           help='Disable MZI insertion loss during training/inference (default: lossless)')
+    mzi_group.add_argument('--lossy-mzi', dest='lossless_mzi', action='store_false',
+                           help='Enable calibrated MZI insertion loss')
 
     # Detection Mode
     detection_group = parser.add_argument_group('Detection Mode')
@@ -56,6 +60,23 @@ def get_args():
                                  choices=['coherent', 'power'],
                                  help='DEPRECATED: Use --detection-mode instead')
 
+    # Optical Fully Connected Layer
+    fc_group = parser.add_argument_group('Optical Fully Connected Layer')
+    fc_group.add_argument('--use-optical-fc', action='store_true', default=True,
+                          help='Use OpticalLoRALinear instead of nn.Linear for final layer')
+    fc_group.add_argument('--no-optical-fc', dest='use_optical_fc', action='store_false',
+                          help='Use electronic nn.Linear for final layer (for comparison)')
+    fc_group.add_argument('--fc-activation-mode', type=str, default='linear',
+                          choices=['linear', 'nonlinear'],
+                          help='Optical FC accumulation mode: '
+                               'linear (pure accumulation) or '
+                               'nonlinear (activation after each slice)')
+    fc_group.add_argument('--num-shared-weights', type=int, default=None,
+                           help='Number of shared weight matrices (K) for the Optical FC layer. '
+                                'If not set, uses full independent weights (N).')
+    fc_group.add_argument('--fc-pos-only', action='store_true', default=False,
+                           help='Optical FC仅使用正路径(禁用差分负路径)用于定位/调试')
+
     # Training Parameters
     train_group = parser.add_argument_group('Training Configuration')
     train_group.add_argument('--batch-size', type=int, default=200,
@@ -68,6 +89,10 @@ def get_args():
                             help='Learning rate')
     train_group.add_argument('--grad-clip', type=float, default=10.0,
                             help='Gradient clipping threshold')
+    train_group.add_argument('--early-stopping', action='store_true', default=False,
+                            help='Enable early stopping')
+    train_group.add_argument('--patience', type=int, default=5,
+                            help='Early stopping patience (epochs without improvement)')
 
     # System Parameters
     sys_group = parser.add_argument_group('System Configuration')
@@ -107,6 +132,8 @@ def get_args():
     print(f"Architecture: {args.input_channels} -> " +
           f"{' -> '.join([str(args.hidden_channels)]*args.num_layers)} -> {args.output_size}")
     print(f"Detection Mode: {args.detection_mode.upper()}")
+    fc_type = f"Optical LoRA ({args.fc_activation_mode})" if args.use_optical_fc else "Electronic (nn.Linear)"
+    print(f"Fully Connected: {fc_type}")
     print(f"Training: {args.epochs} epochs, batch size {args.batch_size}, lr {args.lr}")
     print(f"MZI Config: {args.mzi_repeat_num} repeats, {args.mzi_row_num}x{args.mzi_column_num}")
     print("="*70 + "\n")

@@ -40,43 +40,52 @@ def load_mzi_parameters_from_json(model, json_path):
     total_mzis_loaded = 0
     total_mzis_in_model = 0
 
-    # Traverse the model to find all MZIs
-    for layer_idx, layer in enumerate(model.layers):
+    # Helper function to load MZI parameters
+    def load_mzi_layer_params(mzi_layer):
+        nonlocal total_mzis_loaded, total_mzis_in_model
+        if hasattr(mzi_layer, 'MZI'):
+            for mzi in mzi_layer.MZI:
+                total_mzis_in_model += 1
+                if hasattr(mzi, 'index') and mzi.index is not None:
+                    param_key = str(mzi.index)
+                    if param_key in mzi_params:
+                        params = mzi_params[param_key]
+                        mzi.load_physical_parameters(
+                            a=params['a'],
+                            b=params['b'],
+                            delta_r=params['delta_r'],
+                            phi0=params['phi0']
+                        )
+                        mzi.freeze_fabrication_parameters()
+                        total_mzis_loaded += 1
+                    else:
+                        print(f"Warning: No parameters found for MZI index {mzi.index}")
+
+    # Traverse CNN layers
+    for layer in model.layers:
         if isinstance(layer, CNN_layer):
-            for filter_idx, single_filter in enumerate(layer.filters):
+            for single_filter in layer.filters:
                 if isinstance(single_filter, SingleChannelFilter):
-                    # Traverse MZI layers within the filter
-                    for mzi_layer_idx, mzi_layer in enumerate(single_filter.layers):
-                        if hasattr(mzi_layer, 'MZI'):
-                            # Iterate through each MZI in the layer
-                            for mzi_idx, mzi in enumerate(mzi_layer.MZI):
-                                total_mzis_in_model += 1
+                    for mzi_layer in single_filter.layers:
+                        load_mzi_layer_params(mzi_layer)
 
-                                # Get the global index of this MZI
-                                if hasattr(mzi, 'index') and mzi.index is not None:
-                                    mzi_global_idx = mzi.index
-                                    param_key = str(mzi_global_idx)
+    # Traverse Optical FC layer (if exists)
+    if hasattr(model, 'fc') and hasattr(model.fc, 'encoder_slices'):
+        print(f"\n[Loading MZI Parameters for Optical FC Layer]")
+        # Load encoder slice processors
+        for slice_processor in model.fc.encoder_slices:
+            if hasattr(slice_processor, 'filter') and hasattr(slice_processor.filter, 'layers'):
+                for mzi_layer in slice_processor.filter.layers:
+                    load_mzi_layer_params(mzi_layer)
+        # Load decoder slice processor
+        if hasattr(model.fc.decoder_slice, 'filter') and hasattr(model.fc.decoder_slice.filter, 'layers'):
+            for mzi_layer in model.fc.decoder_slice.filter.layers:
+                load_mzi_layer_params(mzi_layer)
 
-                                    # Load parameters from JSON if available
-                                    if param_key in mzi_params:
-                                        params = mzi_params[param_key]
-                                        mzi.load_physical_parameters(
-                                            a=params['a'],
-                                            b=params['b'],
-                                            delta_r=params['delta_r'],
-                                            phi0=params['phi0']
-                                        )
-                                        # Freeze hardware parameters so they won't be trained
-                                        # Only voltage should be trainable for CNN training
-                                        mzi.freeze_fabrication_parameters()
-                                        total_mzis_loaded += 1
-                                    else:
-                                        print(f"Warning: No parameters found for MZI index {mzi_global_idx}")
-
-    print(f"Successfully loaded parameters for {total_mzis_loaded}/{total_mzis_in_model} MZIs")
+    print(f"\nSuccessfully loaded parameters for {total_mzis_loaded}/{total_mzis_in_model} MZIs")
     print(f"Hardware parameters (FROZEN): a, b, delta_r, phi0")
     print(f"Trainable parameters: voltage (initialized randomly)")
-    print(f"The model will now train voltages to implement CNN weights on calibrated hardware.\n")
+    print(f"The model will now train voltages to implement weights on calibrated hardware.\n")
 
 
 def collect_and_save_filter_data(model, dataloader, device, save_dir="filter_data"):
@@ -121,6 +130,14 @@ def collect_and_save_filter_data(model, dataloader, device, save_dir="filter_dat
                 else:
                     mzi_array_io_waveguide_desc.append(f"Waveguide {i}: Padding")
             current_filter_data['mzi_array_io_waveguide_description'] = mzi_array_io_waveguide_desc
+
+            # Collect Filter Bias
+            if hasattr(module, 'bias'):
+                current_filter_data['filter_bias'] = {
+                    'value': module.bias.detach().cpu().numpy().item(),
+                    'gradient': module.bias.grad.detach().cpu().numpy().item() if module.bias.grad is not None else None,
+                    'requires_grad': module.bias.requires_grad
+                }
 
             mzi_parameters_with_position = []
             for scf_layer_idx, mzi_array_layer_instance in enumerate(module.layers):
@@ -270,6 +287,9 @@ def main():
     Main function: Implements the training and testing pipeline on MNIST dataset
     """
     args = get_args()
+    # Toggle insertion loss via CLI flag (defaults to lossless)
+    os.environ["MZI_LOSSLESS"] = "1" if args.lossless_mzi else "0"
+
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -308,7 +328,9 @@ def main():
         mzi_repeat_num=args.mzi_repeat_num,
         mzi_row_num=args.mzi_row_num,
         mzi_column_num=args.mzi_column_num,
-        detection_mode=args.detection_mode
+        detection_mode=args.detection_mode,
+        use_optical_fc=args.use_optical_fc,
+        fc_activation_mode=args.fc_activation_mode
     ).to(device)
 
     # Load hardware MZI parameters from calibration results
@@ -347,7 +369,15 @@ def main():
     best_model_state = None
     best_epoch = 0
 
+    # Early stopping variables
+    patience_counter = 0
+    early_stop = False
+
     for epoch in range(1, args.epochs + 1):
+        if early_stop:
+            print(f"\n[Early Stopping] Training stopped at epoch {epoch-1}")
+            break
+
         # Train and get epoch metrics
         train_loss, train_acc = train(model, device, train_loader, optimizer, epoch, scaler,
                                       clip_value=args.grad_clip, log_interval=args.log_interval, args=args)
@@ -363,12 +393,18 @@ def main():
         training_log['test_losses'].append(test_loss)
         training_log['test_accuracies'].append(test_acc)
 
-        # Save best model state
+        # Save best model state and check for early stopping
         if test_acc > best_test_accuracy:
             best_test_accuracy = test_acc
             best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
             best_epoch = epoch
+            patience_counter = 0  # Reset patience counter
             print(f"\n[Best Model Updated] Epoch {epoch}: Test Accuracy = {test_acc:.2f}%")
+        else:
+            patience_counter += 1
+            if args.early_stopping and patience_counter >= args.patience:
+                print(f"\n[Early Stopping] No improvement for {args.patience} epochs")
+                early_stop = True
 
         if device.type == 'cuda':
             print_memory_stats()
@@ -384,6 +420,32 @@ def main():
     # 在这里，你需要确保模型已经加载了你想要分析的权重
     # 例如: model.load_state_dict(torch.load('optical_network.pt'))
     collect_and_save_filter_data(model, collect_loader, device)
+
+    # 收集光学全连接层的钩子数据（如果使用）
+    if args.use_optical_fc and hasattr(model, 'fc') and hasattr(model.fc, 'enable_hooks'):
+        print("\n收集光学全连接层Hook数据...")
+        # 启用钩子
+        model.fc.enable_hooks()
+
+        # 在测试集上运行一个batch来收集数据
+        model.eval()
+        with torch.no_grad():
+            for data, _ in test_loader:
+                data = data.to(device)
+                _ = model(data)
+                break  # 只运行一个batch
+
+        # 保存钩子数据
+        fc_hook_filename = (
+            f"fc_hook_data_{args.detection_mode}_"
+            f"ch{args.hidden_channels}_"
+            f"layers{args.num_layers}_"
+            f"ep{best_epoch if best_epoch > 0 else args.epochs}.pt"
+        )
+        model.fc.save_hook_data(fc_hook_filename)
+
+        # 禁用钩子
+        model.fc.disable_hooks()
 
     if args.save_model:
         # Generate descriptive filename with configuration info

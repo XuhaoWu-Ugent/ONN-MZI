@@ -1,4 +1,5 @@
 import math
+import os
 from typing import Dict, Optional, Tuple, Union
 
 import torch
@@ -34,6 +35,7 @@ class MZI(nn.Module):
         epsilon: float = 1e-8,
         trainable_fabrication: bool = False,
         trainable_voltage: bool = True,
+        lossless: bool = False,
     ) -> None:
         super().__init__()
 
@@ -41,9 +43,12 @@ class MZI(nn.Module):
         self.nominal_resistance = float(nominal_resistance)
         self.p_pi = float(p_pi)
         self.epsilon = float(epsilon)
+        # 训练阶段可通过 lossless 参数或环境变量关闭插入损耗
+        self.lossless = bool(lossless) or bool(int(os.getenv("MZI_LOSSLESS", "0")))
 
+        alpha_value = 1.0 if self.lossless else math.sqrt(0.94)
         self.register_buffer(
-            "alpha_amplitude", torch.tensor(math.sqrt(0.94), dtype=torch.float32)
+            "alpha_amplitude", torch.tensor(alpha_value, dtype=torch.float32)
         )
         self.device = torch.device("cuda") if torch.cuda.is_available() else "cpu"
 
@@ -68,6 +73,7 @@ class MZI(nn.Module):
             parts.append(f"index={self.index}")
         parts.append(f"trainable_voltage={self._voltage.requires_grad}")
         parts.append(f"trainable_fabrication={self._raw_a.requires_grad}")
+        parts.append(f"lossless={self.lossless}")
         return ", ".join(parts)
 
     # ------------------------------------------------------------------

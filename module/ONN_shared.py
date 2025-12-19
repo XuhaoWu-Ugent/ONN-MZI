@@ -3,47 +3,25 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from module.CNN import CNN_layer
-from module.optical_linear import OpticalLoRALinear
+from module.optical_linear_shared import OpticalLoRALinear # Modified import
 
 
 class OpticalNetwork(nn.Module):
     """
-    Unified Optical Neural Network with Balanced Architecture
-
-    Architecture Example (hidden_channels=4, num_layers=4):
-        Layer 0: 1 -> 4 channels (4 filters, 4 per input channel)
-        Layer 1: 4 -> 4 channels (4 filters, 1 per input channel, NOT shared)
-        Layer 2: 4 -> 4 channels (4 filters, 1 per input channel, NOT shared)
-        Layer 3: 4 -> 4 channels (4 filters, 1 per input channel, NOT shared)
-        Total: 4+4+4+4 = 16 filters
-
-    Detection Modes:
-        - 'coherent': Complex amplitude interference (phase information preserved)
-        - 'power': Power-domain linear superposition (incoherent detection)
-
-    The network uses the same underlying MZI array architecture for both modes,
-    with the difference being in the detection/measurement process at each filter.
+    Unified Optical Neural Network with Balanced Architecture (Shared Weights Version)
     """
 
     def __init__(self, input_channels, hidden_channels, output_size, mzi_repeat_num,
                  mzi_row_num, mzi_column_num, num_layers=4, input_size=14, kernel_size=3,
-                 detection_mode='coherent', use_optical_fc=True, fc_activation_mode='linear'):
+                 detection_mode='coherent', use_optical_fc=True, fc_activation_mode='linear',
+                 num_shared_weights=None, fc_pos_only: bool = False): # New parameter
         """
-        Initialize the Optical Neural Network
+        Initialize the Optical Neural Network (Shared Weights)
 
         Args:
-            input_channels (int): Number of input channels (typically 1 for grayscale)
-            hidden_channels (int): Number of channels in all layers
-            output_size (int): Size of network output (number of classes)
-            mzi_repeat_num (int): Number of MZI layer repetitions in each filter
-            mzi_row_num (int): Number of MZIs per row in MZI array
-            mzi_column_num (int): Number of MZIs per column in MZI array
-            num_layers (int): Number of CNN layers, default 4
-            input_size (int): Size of input images, default 14
-            kernel_size (int): Size of convolution kernels, default 3
-            detection_mode (str): 'coherent' or 'power', default 'coherent'
-            use_optical_fc (bool): Use OpticalLoRALinear instead of nn.Linear, default True
-            fc_activation_mode (str): 'linear' or 'nonlinear' for optical FC, default 'linear'
+            ...
+            num_shared_weights (int): Number of shared MZI processors for the FC layer. 
+                                      If None, uses full independent processors.
         """
         super(OpticalNetwork, self).__init__()
 
@@ -57,6 +35,8 @@ class OpticalNetwork(nn.Module):
         self.mzi_repeat_num = mzi_repeat_num
         self.mzi_row_num = mzi_row_num
         self.mzi_column_num = mzi_column_num
+        self.num_shared_weights = num_shared_weights
+        self.fc_pos_only = fc_pos_only
 
         # Initialize network components
         self.layers = nn.ModuleList()
@@ -68,7 +48,6 @@ class OpticalNetwork(nn.Module):
         current_size = input_size
 
         # Build CNN layers with batch normalization
-        # All layers after the first will have balanced architecture
         for i in range(num_layers):
             out_channels = hidden_channels
 
@@ -91,7 +70,6 @@ class OpticalNetwork(nn.Module):
         self.flatten = nn.Flatten()
 
         # Calculate final feature dimensions
-        # No 1x1 conv - directly use hidden_channels
         self.feature_size = hidden_channels * current_size * current_size
 
         # Final fully connected layer
@@ -108,7 +86,9 @@ class OpticalNetwork(nn.Module):
                 mzi_row_num=self.mzi_row_num,
                 mzi_column_num=self.mzi_column_num,
                 repeat_num=self.mzi_repeat_num,
-                start_index=fc_start_index
+                start_index=fc_start_index,
+                num_shared_weights=self.num_shared_weights, # Pass shared weights param
+                pos_only=self.fc_pos_only,
             )
         else:
             # Use electronic linear layer
@@ -121,12 +101,6 @@ class OpticalNetwork(nn.Module):
         self._print_architecture_summary(current_size)
 
     def _calculate_total_mzis(self):
-        """
-        Calculate total number of MZIs used by all CNN layers
-
-        Returns:
-            int: Total MZI count
-        """
         total = 0
         for layer in self.layers:
             if isinstance(layer, CNN_layer):
@@ -136,18 +110,13 @@ class OpticalNetwork(nn.Module):
         return total
 
     def _print_architecture_summary(self, final_size):
-        """
-        Print detailed architecture summary
-
-        Args:
-            final_size (int): Final spatial dimension before FC layer
-        """
         print(f"\n{'='*70}")
-        print(f"Optical Neural Network Initialized")
+        print(f"Optical Neural Network Initialized (Shared Weights Version)")
         print(f"{'='*70}")
         print(f"Detection Mode: {self.detection_mode.upper()}")
         print(f"Architecture: {self.input_channels} -> " +
               f"{' -> '.join([str(self.hidden_channels)]*self.num_layers)}")
+        print(f"Shared Weights (K): {self.num_shared_weights if self.num_shared_weights else 'None (Full)'}")
         print(f"\nLayer Details:")
 
         total_filters = 0
@@ -165,20 +134,10 @@ class OpticalNetwork(nn.Module):
         print(f"{'='*70}\n")
 
     def get_all_time(self):
-        """
-        Recursively collect timing statistics from all network components
-
-        Returns:
-            dict: Dictionary containing accumulated timing statistics
-        """
         total_stats = {'allocation': 0, 'computation': 0, 'total': 0}
-
-        # Add current layer timing stats
         for key in total_stats:
             if hasattr(self, 'timing_stats'):
                 total_stats[key] += self.timing_stats[key]
-
-        # Recursively add all sublayer timing stats
         if hasattr(self, 'layers'):
             for layer in self.layers:
                 if hasattr(layer, 'get_all_time'):
@@ -187,55 +146,22 @@ class OpticalNetwork(nn.Module):
                     layer_stats = layer.timing_stats
                 else:
                     continue
-
                 for key in total_stats:
                     total_stats[key] += layer_stats[key]
-
         return total_stats
 
     def forward(self, x):
-        """
-        Forward propagation through the network
-
-        Processing flow:
-        1. Input -> CNN Layers (with batch norm and activation)
-        2. Flatten
-        3. Fully connected layer -> Output
-
-        Args:
-            x (Tensor): Input tensor of shape (batch_size, input_channels, height, width)
-
-        Returns:
-            Tensor: Output predictions of shape (batch_size, output_size)
-        """
-        # Process through CNN layers
         for layer_idx, (layer, bn) in enumerate(zip(self.layers, self.bns)):
-            # Propagate debug flag
             if self.flag == 1:
                 layer.flag = 1
-
-            # Apply CNN layer
             x = layer(x)
-
-            # Batch normalization (optional, currently disabled)
-            # x = bn(x)
-
-            # Convert to real values and apply activation
-            # Different processing based on detection_mode:
-            # - coherent: x is complex amplitude, use abs() to get magnitude
-            # - power: x is real power values, use sqrt() to get amplitude-like scale
             if self.detection_mode == 'coherent':
-                x = torch.abs(x)  # Convert complex amplitude to magnitude
-            else:  # 'power'
-                # x is already real power (positive), convert to amplitude scale
-                # Add small epsilon for numerical stability
+                x = torch.abs(x)
+            else:
                 x = torch.sqrt(x + 1e-8)
-
             x = self.activation(x)
-
-            # Feature map extraction for visualization (if enabled)
             if hasattr(self, 'save_feature_maps') and self.save_feature_maps:
-                batch_idx = 0  # Save first sample in batch
+                batch_idx = 0
                 num_channels = x.shape[1]
                 for ch_idx in range(num_channels):
                     feature_map = x[batch_idx, ch_idx].detach().cpu().numpy()
@@ -247,22 +173,13 @@ class OpticalNetwork(nn.Module):
                         'data': feature_map
                     })
 
-        # Flatten and apply final linear layer
         x = self.flatten(x)
 
-        # Power domain handling for optical FC
         if self.use_optical_fc:
-            # Optical layer needs power domain input (non-negative)
-            # x is currently in amplitude scale after activation
-            x = x ** 2  # amplitude -> power domain
-
-            x = self.fc(x)  # OpticalLoRALinear (operates in power domain)
-
-            # Output includes electrical bias and can be negative (Logits).
-            # Do NOT take sqrt here.
-            # x = torch.sqrt(x + 1e-8)
+            x = x ** 2
+            x = self.fc(x)
+            # No sqrt here, using raw logits
         else:
-            # Electronic linear layer (no domain conversion needed)
             x = self.fc(x)
 
         return x
