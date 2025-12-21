@@ -93,6 +93,10 @@ def get_args():
                             help='Enable early stopping')
     train_group.add_argument('--patience', type=int, default=5,
                             help='Early stopping patience (epochs without improvement)')
+    train_group.add_argument('--weight-noise-sigma', type=float, default=0.0,
+                            help='Standard deviation of Gaussian noise added to weights during training')
+    train_group.add_argument('--input-noise-sigma', type=float, default=0.0,
+                            help='Standard deviation of Gaussian noise added to input data during training')
 
     # System Parameters
     sys_group = parser.add_argument_group('System Configuration')
