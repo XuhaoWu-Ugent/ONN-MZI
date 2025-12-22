@@ -143,15 +143,22 @@ def train_distill(student, teacher, device, train_loader, optimizer, epoch, scal
         data, target = data.to(device), target.to(device)
         
         # --- Data Preparation ---
-        # 1. Clean Data for Teacher (Resized to 32x32 for ResNet)
         with torch.no_grad():
-            clean_input = F.interpolate(data, size=(32, 32), mode='bilinear', align_corners=False)
-            teacher_logits = teacher(clean_input)
+            # [CRITICAL UPDATE] Resolution Matching
+            # 1. First, downsample to Student's resolution (e.g., 14x14) to simulate information loss.
+            #    This forces the Teacher to form opinions based ONLY on features the Student can actually see.
+            low_res_data = F.interpolate(data, size=(args.input_size, args.input_size), mode='bilinear', align_corners=False)
+            
+            # 2. Then upscale to 32x32 because ResNet expects larger inputs.
+            #    The image is now "blurry" (32x32 pixels, but only 14x14 effective info).
+            teacher_input = F.interpolate(low_res_data, size=(32, 32), mode='bilinear', align_corners=False)
+            
+            teacher_logits = teacher(teacher_input)
 
-        # 2. Noisy Data for Student (Resized to 14x14 for ONN + Noise)
-        # Resize first
-        student_input = F.interpolate(data, size=(args.input_size, args.input_size), mode='bilinear', align_corners=False)
-        # Add Noise (Manually apply transform since we need clean for teacher)
+        # 3. Noisy Data for Student (Start from the same low_res_data)
+        student_input = low_res_data.clone()
+        
+        # Add Noise
         if current_sigma > 0:
             student_input = student_input + torch.randn_like(student_input) * current_sigma
         
