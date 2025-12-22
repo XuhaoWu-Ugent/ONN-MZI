@@ -72,22 +72,54 @@ def train_teacher_if_needed(device, train_loader, test_loader, rank=0):
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     criterion = nn.CrossEntropyLoss()
     
-    # Train for 5 epochs (usually enough for ResNet18 on MNIST to hit 99%)
+    # Train for 5 epochs
     for epoch in range(5):
         model.train()
         for data, target in train_loader:
             data, target = data.to(device), target.to(device)
-            # Resize to 32x32 for ResNet
-            data = F.interpolate(data, size=(32, 32), mode='bilinear', align_corners=False)
+            # Downsample strategy for training
+            data_small = F.interpolate(data, size=(14, 14), mode='bilinear', align_corners=False)
+            data_upscaled = F.interpolate(data_small, size=(32, 32), mode='bilinear', align_corners=False)
             
             optimizer.zero_grad()
-            output = model(data)
+            output = model(data_upscaled)
             loss = criterion(output, target)
             loss.backward()
             optimizer.step()
         
         if rank == 0:
-            print(f"[Teacher] Epoch {epoch+1}/5 completed.")
+            print(f"[Teacher] Epoch {epoch+1}/5 training completed.")
+
+    # Evaluate Teacher Quality
+    model.eval()
+    correct = 0
+    total = 0
+    with torch.no_grad():
+        for data, target in test_loader:
+            data, target = data.to(device), target.to(device)
+            # Use same downsample strategy for evaluation
+            data_small = F.interpolate(data, size=(14, 14), mode='bilinear', align_corners=False)
+            data_upscaled = F.interpolate(data_small, size=(32, 32), mode='bilinear', align_corners=False)
+            
+            output = model(data_upscaled)
+            pred = output.argmax(dim=1)
+            correct += pred.eq(target).sum().item()
+            total += target.size(0)
+    
+    # Sync metrics
+    if dist.is_initialized():
+        c_tensor = torch.tensor([correct], device=device)
+        t_tensor = torch.tensor([total], device=device)
+        dist.all_reduce(c_tensor, op=dist.ReduceOp.SUM)
+        dist.all_reduce(t_tensor, op=dist.ReduceOp.SUM)
+        correct = c_tensor.item()
+        total = t_tensor.item()
+
+    acc = 100. * correct / total
+    if rank == 0:
+        print(f"===================================================")
+        print(f"[Teacher] Final Test Accuracy (on 14x14 blurry inputs): {acc:.2f}%")
+        print(f"===================================================")
 
     # Save
     if rank == 0:
