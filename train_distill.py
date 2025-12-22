@@ -365,8 +365,13 @@ def main():
         if rank == 0 and test_acc > best_test_accuracy:
             best_test_accuracy = test_acc
             model_to_save = student.module if is_distributed else student
-            torch.save(model_to_save.state_dict(), f"distilled_shared_K{args.num_shared_weights}_best.pt")
-            print(f"[Best Student Updated] Acc: {test_acc:.2f}%")
+            
+            # Allow custom suffix for parameter sweeps
+            suffix = os.environ.get('SAVE_SUFFIX', '')
+            save_name = f"distilled_shared_K{args.num_shared_weights}{suffix}_best.pt"
+            
+            torch.save(model_to_save.state_dict(), save_name)
+            print(f"[Best Student Updated] Acc: {test_acc:.2f}% (Saved to {save_name})")
 
     if is_distributed: dist.destroy_process_group()
 
