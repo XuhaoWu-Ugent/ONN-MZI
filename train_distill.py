@@ -115,7 +115,9 @@ def distillation_loss(student_logits, teacher_logits, temperature=4.0, alpha=0.5
     student_log_softmax = F.log_softmax(student_logits / temperature, dim=1)
     
     # KL Divergence
-    distill_loss = F.kl_div(student_log_softmax, soft_targets, reduction='batchmean') * (temperature ** 2)
+    # We REMOVE (temperature ** 2) scaling here to keep loss magnitude comparable to CE.
+    # This is often more stable for hardware-constrained networks.
+    distill_loss = F.kl_div(student_log_softmax, soft_targets, reduction='batchmean')
     
     return distill_loss
 
@@ -134,7 +136,7 @@ def train_distill(student, teacher, device, train_loader, optimizer, epoch, scal
     
     # Distillation Hyperparams
     TEMP = 4.0
-    ALPHA = 0.7 # 70% learn from Teacher, 30% learn from Hard Labels
+    ALPHA = 0.5 # Balanced weight since we removed T^2 scaling
     
     for batch_idx, (data, target) in enumerate(train_loader):
         data, target = data.to(device), target.to(device)
@@ -179,7 +181,15 @@ def train_distill(student, teacher, device, train_loader, optimizer, epoch, scal
 
         if batch_idx % args.log_interval == 0 and rank == 0:
             acc = 100. * epoch_correct / total_samples
-            print(f'Train Epoch: {epoch} [{batch_idx * len(data)}/{len(train_loader.dataset)}]\t'
+            
+            # Fix Distributed Logging: Show local dataset size (15000) instead of global (60000)
+            if dist.is_initialized() and hasattr(train_loader, 'sampler'):
+                dataset_size = len(train_loader.sampler)
+            else:
+                dataset_size = len(train_loader.dataset)
+                
+            print(f'Train Epoch: {epoch} [{batch_idx * len(data)}/{dataset_size} '
+                  f'({100. * batch_idx / len(train_loader):.0f}%)]\t'
                   f'Loss: {loss.item():.6f} (CE:{loss_ce.item():.2f}, KD:{loss_kd.item():.2f})\tAcc: {acc:.2f}%')
 
     return epoch_loss / total_samples, 100. * epoch_correct / total_samples

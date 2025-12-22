@@ -263,6 +263,22 @@ class OpticalLoRALinear(nn.Module):
         matrices_list = [p._get_combined_matrix(device) for p in slice_processors]
         k_matrices = torch.stack(matrices_list)
 
+        # === Hook: Record Physical Processor Data ===
+        # Since we use vectorized einsum, we manually trigger hooks for physical processors
+        first_p = slice_processors[0]
+        if first_p.enable_hook:
+            for i, p in enumerate(slice_processors):
+                # Record Voltages
+                v_list = []
+                for layer in p.layers:
+                    if hasattr(layer, 'MZI'):
+                        for mzi in layer.MZI: v_list.append(mzi.get_voltage().item())
+                p.hook_data['mzi_voltages'] = torch.tensor(v_list)
+                
+                # Record Input (for physical processor i, we take the corresponding slice from batch)
+                # In shared mode, processor i handles multiple slices. We record the first occurrence.
+                p.hook_data['optical_input'] = x_sliced[:, i, :].detach().cpu().clone()
+
         # Step 3.5: Expand to Logical Matrices [N, 20, 20]
         if num_physical_processors < num_slices:
             # Weight Sharing: Map N slices to K processors
@@ -276,8 +292,8 @@ class OpticalLoRALinear(nn.Module):
         x_complex = x_amplitude.to(torch.complex64)
 
         # Step 5: State Vectors
-        matrix_size = slice_processors[0].matrix_size
-        num_ports = slice_processors[0].num_ports
+        matrix_size = first_p.matrix_size
+        num_ports = first_p.num_ports
         state_vectors = torch.zeros(batch_size, num_slices, matrix_size,
                                   dtype=torch.complex64, device=device)
         state_vectors[:, :, :num_ports] = x_complex
@@ -288,6 +304,13 @@ class OpticalLoRALinear(nn.Module):
         # Step 7: Output
         output_complex = new_states[:, :, num_ports : 2*num_ports]
         output_power = torch.abs(output_complex) ** 2
+        
+        # === Hook: Record Physical Output Power ===
+        if first_p.enable_hook:
+            for i, p in enumerate(slice_processors):
+                # Again, record the output of the first slice handled by this processor
+                p.hook_data['optical_output'] = output_power[:, i, :].detach().cpu().clone()
+
         hidden = output_power.sum(dim=1)
 
         # Normalization
@@ -297,6 +320,7 @@ class OpticalLoRALinear(nn.Module):
 
     def forward_decoder(self, hidden, decoder_processor):
         hidden = torch.abs(hidden)
+        # decoder_processor.forward already handles hooks
         output = decoder_processor(hidden)
         return output
 
