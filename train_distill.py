@@ -136,7 +136,8 @@ def train_distill(student, teacher, device, train_loader, optimizer, epoch, scal
     
     # Distillation Hyperparams
     TEMP = 4.0
-    ALPHA = 0.5 # Balanced weight since we removed T^2 scaling
+    # Read ALPHA from environment variable if available, else default to 0.5
+    ALPHA = float(os.environ.get('DISTILL_ALPHA', 0.5))
     
     for batch_idx, (data, target) in enumerate(train_loader):
         data, target = data.to(device), target.to(device)
