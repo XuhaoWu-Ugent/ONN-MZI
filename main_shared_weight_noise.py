@@ -23,34 +23,25 @@ import os
 import json
 
 
+from torch.amp import autocast
+
 def load_mzi_parameters_from_json(model, json_path):
     if not os.path.exists(json_path): return
     with open(json_path, 'r') as f: mzi_params = json.load(f)
     
-    total_mzis_loaded = 0
-    total_mzis_in_model = 0
-
     def load_mzi_layer_params(mzi_layer):
-        nonlocal total_mzis_loaded, total_mzis_in_model
         if hasattr(mzi_layer, 'MZI'):
             for mzi in mzi_layer.MZI:
-                total_mzis_in_model += 1
                 if hasattr(mzi, 'index') and mzi.index is not None:
-                    # IMPLEMENTATION OF PARAMETER REUSE
-                    # Map global index to 50 physical MZIs
                     physical_index = mzi.index % 50
                     param_key = str(physical_index)
-                    
                     if param_key in mzi_params:
                         params = mzi_params[param_key]
                         mzi.load_physical_parameters(
-                            a=params['a'],
-                            b=params['b'],
-                            delta_r=params['delta_r'],
-                            phi0=params['phi0']
+                            a=params['a'], b=params['b'],
+                            delta_r=params['delta_r'], phi0=params['phi0']
                         )
                         mzi.freeze_fabrication_parameters()
-                        total_mzis_loaded += 1
 
     for layer in model.layers:
         if isinstance(layer, CNN_layer):
@@ -58,7 +49,6 @@ def load_mzi_parameters_from_json(model, json_path):
                 for ml in f.layers: load_mzi_layer_params(ml)
 
     if hasattr(model, 'fc'):
-        # Supports Shared Dual-Path structure
         for path in ['pos_encoder_slices', 'neg_encoder_slices']:
             if hasattr(model.fc, path):
                 for p in getattr(model.fc, path):
@@ -66,6 +56,120 @@ def load_mzi_parameters_from_json(model, json_path):
         for path in ['pos_decoder_slice', 'neg_decoder_slice']:
             if hasattr(model.fc, path):
                 for ml in getattr(model.fc, path).layers: load_mzi_layer_params(ml)
+
+# === New Training Function with Weight Noise Injection ===
+def train_with_weight_noise(model, device, train_loader, optimizer, epoch, scaler, args,
+                            clip_value=1.0, log_interval=5, scheduler=None, rank=0):
+    model.train()
+    epoch_loss = 0.0
+    epoch_correct = 0
+    total_samples = 0
+    criterion = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
+    
+    sigma = args.weight_noise_sigma
+    if rank == 0 and epoch == 1 and sigma > 0:
+        print(f"[Training] Weight Noise Regularization Enabled: sigma={sigma}")
+
+    for batch_idx, (data, target) in enumerate(train_loader):
+        data, target = data.to(device), target.to(device)
+        optimizer.zero_grad()
+        
+        # 1. Inject Noise (Forward)
+        saved_params = {}
+        if sigma > 0:
+            for name, param in model.named_parameters():
+                if param.requires_grad:
+                    saved_params[name] = param.data.clone()
+                    noise = torch.randn_like(param) * sigma
+                    param.data.add_(noise)
+        
+        use_cuda = not args.no_cuda and torch.cuda.is_available()
+        with autocast("cuda" if use_cuda else "cpu"):
+            output = model(data)
+            loss = criterion(output, target)
+        
+        scaler.scale(loss).backward()
+        
+        # 2. Restore Weights (Backward)
+        if sigma > 0:
+            for name, param in model.named_parameters():
+                if param.requires_grad:
+                    param.data.copy_(saved_params[name])
+
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=clip_value)
+        scaler.step(optimizer)
+        scaler.update()
+        if scheduler: scheduler.step()
+
+        epoch_loss += loss.item() * len(data)
+        pred = output.argmax(dim=1, keepdim=True)
+        epoch_correct += pred.eq(target.view_as(pred)).sum().item()
+        total_samples += len(data)
+
+        if batch_idx % log_interval == 0 and rank == 0:
+            correct = pred.eq(target.view_as(pred)).sum().item()
+            acc = 100. * correct / len(data)
+            print(f'Train Epoch: {epoch} [{batch_idx * len(data)}/{len(train_loader.dataset)}]\tLoss: {loss.item():.6f}\tAcc: {acc:.2f}%')
+
+    return epoch_loss / total_samples, 100. * epoch_correct / total_samples
+
+# === New Robustness Test Function with Dynamic Noise & Ensemble ===
+def test_robustness(model, device, test_loader, args, rank=0, num_repeats=5):
+    model.eval()
+    test_loss = 0
+    correct = 0
+    sigma = args.weight_noise_sigma
+    
+    # Cache clean weights
+    original_weights = {name: p.data.clone() for name, p in model.named_parameters()}
+
+    with torch.no_grad():
+        for data, target in test_loader:
+            data, target = data.to(device), target.to(device)
+            output_sum = None
+            
+            # Ensemble Loop
+            for _ in range(num_repeats):
+                # Inject Dynamic Noise for THIS inference pass
+                if sigma > 0:
+                    for name, param in model.named_parameters():
+                        if param.requires_grad:
+                            noise = torch.randn_like(param) * sigma
+                            param.data.copy_(original_weights[name] + noise)
+                
+                output = model(data)
+                if output_sum is None: output_sum = output
+                else: output_sum += output
+            
+            # Restore clean weights for next batch
+            if sigma > 0:
+                for name, param in model.named_parameters():
+                    if param.requires_grad:
+                        param.data.copy_(original_weights[name])
+
+            output_avg = output_sum / num_repeats
+            test_loss += F.cross_entropy(output_avg, target, reduction='sum').item()
+            pred = output_avg.argmax(dim=1, keepdim=True)
+            correct += pred.eq(target.view_as(pred)).sum().item()
+
+    if dist.is_initialized():
+        l_tensor = torch.tensor([test_loss], device=device)
+        c_tensor = torch.tensor([correct], device=device)
+        dist.all_reduce(l_tensor, op=dist.ReduceOp.SUM)
+        dist.all_reduce(c_tensor, op=dist.ReduceOp.SUM)
+        test_loss, correct = l_tensor.item(), int(c_tensor.item())
+        
+    total_samples = len(test_loader.dataset)
+    test_loss /= total_samples
+    accuracy = 100. * correct / total_samples
+
+    if rank == 0:
+        print(f'\n[Robust Test] Sigma={sigma} | Ensemble={num_repeats}x')
+        print(f'Test set: Average loss: {test_loss:.4f}, Accuracy: {correct}/{total_samples} ({accuracy:.2f}%)\n')
+
+    return test_loss, accuracy
+
 
 
 def train_with_weight_noise(model, device, train_loader, optimizer, epoch, scaler, args,
@@ -245,7 +349,7 @@ def main():
 
     # Only print from rank 0
     if rank == 0:
-        print(f"\n[Starting Optimized Shared Training with K={args.num_shared_weights}]")
+        print(f"\n[Starting Shared Training K={args.num_shared_weights}]")
         print(f"[Distributed Training] World Size: {world_size}, Rank: {rank}")
         if args.weight_noise_sigma > 0:
             print(f"[Weight Noise] Enabled with sigma={args.weight_noise_sigma}")
@@ -255,13 +359,17 @@ def main():
         if is_distributed:
             train_sampler.set_epoch(epoch)
 
-        # Use our local train function with noise injection
+        # 1. Train with Noise Regularization (Static Noise during Forward)
         train_loss, train_acc = train_with_weight_noise(
             model, device, train_loader, optimizer, epoch, scaler,
             clip_value=args.grad_clip, log_interval=args.log_interval,
             args=args, scheduler=scheduler, rank=rank
         )
-        test_loss, test_acc = test(model, device, test_loader, rank=rank)
+        
+        # 2. Test with Robustness Simulation (Dynamic Noise per Inference + Ensemble)
+        test_loss, test_acc = test_robustness(
+            model, device, test_loader, args, rank=rank, num_repeats=5
+        )
 
         # Only save model from rank 0
         if rank == 0:
@@ -269,7 +377,7 @@ def main():
                 best_test_accuracy = test_acc
                 if args.save_model:
                     model_to_save = model.module if is_distributed else model
-                    torch.save(model_to_save.state_dict(), f"optimized_shared_K{args.num_shared_weights}_best.pt")
+                    torch.save(model_to_save.state_dict(), f"robust_shared_K{args.num_shared_weights}_best.pt")
                     print(f"[Best Model Updated] Acc: {test_acc:.2f}%")
 
     if rank == 0 and args.wandb:

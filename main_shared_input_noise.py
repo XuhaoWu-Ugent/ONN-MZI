@@ -33,6 +33,48 @@ class AddGaussianNoise(object):
         return self.__class__.__name__ + '(mean={0}, std={1})'.format(self.mean, self.std)
 
 
+# === New Dynamic Noise Class for Annealing ===
+class DynamicGaussianNoise(object):
+    def __init__(self, mean=0., std=0.):
+        self.std = std
+        self.mean = mean
+    def set_std(self, new_std):
+        self.std = new_std
+    def __call__(self, tensor):
+        if self.std <= 0: return tensor
+        return tensor + torch.randn(tensor.size()) * self.std + self.mean
+
+# === New Ensemble Test Function (Distributed-aware) ===
+def test_ensemble(model, device, test_loader, rank=0, num_repeats=5):
+    model.eval()
+    test_loss = 0
+    correct = 0
+    with torch.no_grad():
+        for data, target in test_loader:
+            data, target = data.to(device), target.to(device)
+            output_sum = None
+            for _ in range(num_repeats):
+                output = model(data)
+                if output_sum is None: output_sum = output
+                else: output_sum += output
+            output_avg = output_sum / num_repeats
+            test_loss += F.cross_entropy(output_avg, target, reduction='sum').item()
+            pred = output_avg.argmax(dim=1, keepdim=True)
+            correct += pred.eq(target.view_as(pred)).sum().item()
+    if dist.is_initialized():
+        l_tensor = torch.tensor([test_loss], device=device)
+        c_tensor = torch.tensor([correct], device=device)
+        dist.all_reduce(l_tensor, op=dist.ReduceOp.SUM)
+        dist.all_reduce(c_tensor, op=dist.ReduceOp.SUM)
+        test_loss, correct = l_tensor.item(), int(c_tensor.item())
+    total_samples = len(test_loader.dataset)
+    test_loss /= total_samples
+    accuracy = 100. * correct / total_samples
+    if rank == 0:
+        print(f'\nTest set (Ensemble {num_repeats}x): Average loss: {test_loss:.4f}, Accuracy: {correct}/{total_samples} ({accuracy:.2f}%)\n')
+    return test_loss, accuracy
+
+
 def load_mzi_parameters_from_json(model, json_path):
     if not os.path.exists(json_path): return
     with open(json_path, 'r') as f: mzi_params = json.load(f)
@@ -106,23 +148,31 @@ def main():
     if torch.cuda.is_available():
         torch.cuda.manual_seed(args.seed + rank)
     
+    # === Initialize Dynamic Noise for Annealing ===
+    noise_transform = DynamicGaussianNoise(0., 0.) # Starts at 0
+    
     # 优化数据加载
     transform_list = [
         transforms.Resize((args.input_size, args.input_size)),
         transforms.ToTensor(),
-        transforms.Normalize((0.1307,), (0.3081,))
+        transforms.Normalize((0.1307,), (0.3081,)),
+        noise_transform
     ]
-
-    # Add Gaussian Noise if requested
-    if args.input_noise_sigma > 0:
-        if rank == 0:
-            print(f"[Input Noise] Adding Gaussian Noise with sigma={args.input_noise_sigma} to training data.")
-        transform_list.append(AddGaussianNoise(0., args.input_noise_sigma))
+    
+    # Test set always uses the target noise to monitor robustness improvement
+    test_noise_transform = DynamicGaussianNoise(0., args.input_noise_sigma)
+    test_transform_list = [
+        transforms.Resize((args.input_size, args.input_size)),
+        transforms.ToTensor(),
+        transforms.Normalize((0.1307,), (0.3081,)),
+        test_noise_transform
+    ]
     
     train_transform = transforms.Compose(transform_list)
+    test_transform = transforms.Compose(test_transform_list)
     
     train_dataset = datasets.MNIST('../data', train=True, download=True, transform=train_transform)
-    test_dataset = datasets.MNIST('../data', train=False, transform=train_transform)
+    test_dataset = datasets.MNIST('../data', train=False, transform=test_transform)
 
     # Use DistributedSampler for distributed training
     if is_distributed:
@@ -165,19 +215,35 @@ def main():
     best_test_accuracy = 0.0
 
     # Only print from rank 0
+    target_sigma = args.input_noise_sigma
     if rank == 0:
         print(f"\n[Starting Optimized Shared Training with K={args.num_shared_weights}]")
         print(f"[Distributed Training] World Size: {world_size}, Rank: {rank}")
+        print(f"[Noise Annealing] Target Input Noise Sigma: {target_sigma}")
 
     for epoch in range(1, args.epochs + 1):
         # Set epoch for DistributedSampler
         if is_distributed:
             train_sampler.set_epoch(epoch)
 
+        # === Noise Annealing Strategy ===
+        if epoch <= 5:
+            curr_sigma = 0.0
+        elif epoch <= 15:
+            curr_sigma = target_sigma * ((epoch - 5) / 10.0)
+        else:
+            curr_sigma = target_sigma
+        noise_transform.set_std(curr_sigma)
+        
+        if rank == 0:
+            print(f"\n>>> Epoch {epoch} | Train Noise Sigma: {curr_sigma:.4f}")
+
         train_loss, train_acc = train(model, device, train_loader, optimizer, epoch, scaler,
                                       clip_value=args.grad_clip, log_interval=args.log_interval,
                                       args=args, scheduler=scheduler, rank=rank)
-        test_loss, test_acc = test(model, device, test_loader, rank=rank)
+        
+        # Upgrade to Ensemble Test (5x passes) to improve accuracy under noise
+        test_loss, test_acc = test_ensemble(model, device, test_loader, rank=rank, num_repeats=5)
 
         # Only save model from rank 0
         if rank == 0:
