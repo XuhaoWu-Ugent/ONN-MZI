@@ -213,6 +213,9 @@ def train_distill(student, teacher, device, train_loader, optimizer, epoch, scal
             # Get Student Logits AND Features
             student_logits, student_feat = student(student_input, return_features=True)
             
+            # Flatten Student Features
+            student_feat = torch.flatten(student_feat, 1)
+
             # Align Features: Student(1728) -> Adapter -> 512
             student_feat_adapted = feature_adapter(student_feat)
             
