@@ -52,13 +52,14 @@ def collect_hardware_data():
     ).to(device)
 
     # 2. Load the best weights
-    # Assuming the distilled model or the standard shared model
-    checkpoint_path = f"distilled_shared_K{args.num_shared_weights}_best.pt"
+    checkpoint_path = f"distilled_shared_K{args.num_shared_weights}_alpha0.5_sigma0.15_best.pt"
+    if not os.path.exists(checkpoint_path):
+        checkpoint_path = f"distilled_shared_K{args.num_shared_weights}_best.pt"
     if not os.path.exists(checkpoint_path):
         checkpoint_path = f"optimized_shared_K{args.num_shared_weights}_best.pt"
     
     if not os.path.exists(checkpoint_path):
-        print(f"Error: No checkpoint found for K={args.num_shared_weights}")
+        print(f"Error: No checkpoint found.")
         return
     
     print(f"Loading weights from {checkpoint_path}...")
@@ -66,81 +67,115 @@ def collect_hardware_data():
     load_mzi_parameters_from_json(model, 'results/mzi_parameters.json')
     model.eval()
 
-    # 3. Enable Hooks across the entire network
+    # 3. Enable Hooks
     print("Enabling hardware hooks...")
-    # CNN Layers
     for layer in model.layers:
         if isinstance(layer, CNN_layer):
             for filt in layer.filters:
                 filt.enable_hooks()
-    # FC Layer
     if hasattr(model, 'fc'):
         model.fc.enable_hooks()
 
-    # 4. Prepare a sample input
+    # 4. Prepare Input (保留 Normalize 以维持模型精度)
     test_loader = torch.utils.data.DataLoader(
         datasets.MNIST('../data', train=False, transform=transforms.Compose([
             transforms.ToTensor(),
-            transforms.Normalize((0.1307,), (0.3081,))
+            transforms.Normalize((0.1307,), (0.3081,)) 
         ])),
         batch_size=1, shuffle=True
     )
     data, target = next(iter(test_loader))
     data = data.to(device)
-    # Resize for ONN
     data_onn = F.interpolate(data, size=(args.input_size, args.input_size), mode='bilinear')
 
-    # 5. Run Forward Pass to excite the circuits
-    print("Running inference to capture optical powers...")
+    # 5. Run Forward Pass
+    print("Running inference...")
     with torch.no_grad():
         _ = model(data_onn)
 
-    # 6. Extract Data Structure
+    # 6. Extract Data
     results = {
         'metadata': {
             'K': args.num_shared_weights,
-            'input_channels': args.input_channels,
-            'hidden_channels': args.hidden_channels,
-            'num_layers': args.num_layers
+            'detection_mode': args.detection_mode,
         },
-        'layers': []
+        'layers': [],
+        'fc': {}
     }
 
-    def get_info(module):
-        return {
+    def get_info(module, bias_val=None, path_type=None, component_type=None, override_input_power=None, tag=None):
+        info = {
+            'tag': tag,
+            'path_type': path_type,
+            'component_type': component_type,
             'voltages': module.hook_data['mzi_voltages'].numpy() if module.hook_data['mzi_voltages'] is not None else None,
-            'in_power': module.hook_data['optical_input'].numpy() if module.hook_data['optical_input'] is not None else None,
-            'out_power': module.hook_data['optical_output'].numpy() if module.hook_data['optical_output'] is not None else None
+            'out_power': module.hook_data['optical_output'].numpy() if module.hook_data['optical_output'] is not None else None,
+            'bias': bias_val.detach().cpu().numpy() if bias_val is not None else None
         }
+        
+        if override_input_power is not None:
+            info['in_power'] = override_input_power.numpy()
+        else:
+            info['in_power'] = module.hook_data['optical_input'].numpy() if module.hook_data['optical_input'] is not None else None
+                
+        return info
 
-    # Extract CNN Layers
+    # Extract CNN Layers (拆分为正负路对)
     for i, layer in enumerate(model.layers):
         if isinstance(layer, CNN_layer):
-            layer_data = {'layer_idx': i, 'filters': []}
-            for j, filt in enumerate(layer.filters):
-                layer_data['filters'].append(get_info(filt))
-            results['layers'].append(layer_data)
+            layer_info = {'layer_idx': i, 'filters': []}
+            for filt_idx, filt in enumerate(layer.filters):
+                raw_input = filt.hook_data['optical_input']
+                if raw_input is not None:
+                    if raw_input.is_complex(): raw_input = raw_input.real
+                    
+                    # 正路: P_pos = ReLU(x)^2
+                    pos_input = torch.abs(F.relu(raw_input)) ** 2
+                    layer_info['filters'].append(get_info(
+                        filt, bias_val=filt.bias, tag=f"filt{filt_idx}_pos",
+                        path_type='positive', component_type='cnn_filter', override_input_power=pos_input
+                    ))
+                    
+                    # 负路: P_neg = ReLU(-x)^2
+                    neg_input = torch.abs(F.relu(-raw_input)) ** 2
+                    layer_info['filters'].append(get_info(
+                        filt, bias_val=filt.bias, tag=f"filt{filt_idx}_neg",
+                        path_type='negative', component_type='cnn_filter', override_input_power=neg_input
+                    ))
+            results['layers'].append(layer_info)
 
-    # Extract FC Layer
+    # Extract FC Layer (按照正/负路成对提取，方便硬件顺序测试)
     if hasattr(model, 'fc'):
-        fc_data = {'type': 'FC_LoRA', 'processors': {}}
-        for i, p in enumerate(model.fc.pos_encoder_slices):
-            fc_data['processors'][f'pos_enc_k{i}'] = get_info(p)
-        for i, p in enumerate(model.fc.neg_encoder_slices):
-            fc_data['processors'][f'neg_enc_k{i}'] = get_info(p)
-        fc_data['processors']['pos_dec'] = get_info(model.fc.pos_decoder_slice)
-        fc_data['processors']['neg_dec'] = get_info(model.fc.neg_decoder_slice)
-        results['fc'] = fc_data
+        fc_res = {
+            'global_bias': model.fc.bias.detach().cpu().numpy(), 
+            'processors': [] # 改为列表结构
+        }
+        
+        # 1. 提取 Encoders (成对: Pos0, Neg0, Pos1, Neg1...)
+        num_enc = len(model.fc.pos_encoder_slices)
+        for i in range(num_enc):
+            p_pos = model.fc.pos_encoder_slices[i]
+            p_neg = model.fc.neg_encoder_slices[i]
+            
+            fc_res['processors'].append(get_info(p_pos, path_type='positive', component_type='encoder', tag=f"enc{i}_pos"))
+            fc_res['processors'].append(get_info(p_neg, path_type='negative', component_type='encoder', tag=f"enc{i}_neg"))
+            
+        # 2. 提取 Decoders (成对: Pos, Neg)
+        fc_res['processors'].append(get_info(model.fc.pos_decoder_slice, path_type='positive', component_type='decoder', tag="dec_pos"))
+        fc_res['processors'].append(get_info(model.fc.neg_decoder_slice, path_type='negative', component_type='decoder', tag="dec_neg"))
+        
+        results['fc'] = fc_res
 
-    # 7. Save to NPY
-    save_path = f"results/mzi_voltage_power_dump_K{args.num_shared_weights}.npy"
+    # 7. Save
+    save_path = f"results/mzi_hardware_data_K{args.num_shared_weights}.npy"
     np.save(save_path, results)
-    
     print(f"\n{'='*60}")
     print(f"Hardware snapshot saved to: {save_path}")
-    print(f"Captured data for {len(results['layers'])} CNN layers and 1 FC layer.")
-    print(f"Total physical FC processors: {len(model.fc.pos_encoder_slices)}")
-    print(f"{'='*60}\n")
+    print(f"Captured data for {len(results['layers'])} CNN layers.")
+    print(f"CNN Layer 0: {len(results['layers'][0]['filters'])} entries (12 filters * 2 paths)")
+    if hasattr(model, 'fc'):
+        print(f"FC Layer: {len(results['fc']['processors'])} entries ({num_enc*2} encoders + 2 decoders)")
+    print(f"{ '='*60}\n")
 
 if __name__ == "__main__":
     if not os.path.exists('results'): os.makedirs('results')

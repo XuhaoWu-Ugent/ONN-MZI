@@ -10,7 +10,7 @@ class NumpyJSONEncoder(json.JSONEncoder):
     def default(self, obj):
         if isinstance(obj, np.ndarray):
             return obj.tolist()
-        if isinstance(obj, (np.complex_, np.complex64, np.complex128)):
+        if isinstance(obj, (complex, np.complex_, np.complex64, np.complex128)):
             return str(obj)
         if isinstance(obj, (np.float_, np.float16, np.float32, np.float64)):
             return float(obj)
@@ -46,7 +46,9 @@ def convert_npy_to_json(npy_path, json_path):
 if __name__ == '__main__':
     # Define the input and output file paths relative to this script's location
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    input_npy_file = os.path.join(base_dir, 'filter_data', 'hook_data_verified.npy')
-    output_json_file = os.path.join(base_dir, 'filter_data', 'hook_data_verified.json')
+    # input_npy_file = os.path.join(base_dir, 'filter_data', 'hook_data_verified.npy')
+    # output_json_file = os.path.join(base_dir, 'filter_data', 'hook_data_verified.json')
     
+    input_npy_file = os.path.join(base_dir, 'results', 'mzi_hardware_data_K15.npy')
+    output_json_file = os.path.join(base_dir, 'results', 'mzi_hardware_data_K15.json')
     convert_npy_to_json(input_npy_file, output_json_file)
