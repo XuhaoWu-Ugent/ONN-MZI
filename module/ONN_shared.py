@@ -150,7 +150,7 @@ class OpticalNetwork(nn.Module):
                     total_stats[key] += layer_stats[key]
         return total_stats
 
-    def forward(self, x):
+    def forward(self, x, return_features=False):
         for layer_idx, (layer, bn) in enumerate(zip(self.layers, self.bns)):
             if self.flag == 1:
                 layer.flag = 1
@@ -173,6 +173,9 @@ class OpticalNetwork(nn.Module):
                         'data': feature_map
                     })
 
+        # Capture features before flattening
+        features = x
+
         x = self.flatten(x)
 
         if self.use_optical_fc:
@@ -182,4 +185,6 @@ class OpticalNetwork(nn.Module):
         else:
             x = self.fc(x)
 
+        if return_features:
+            return x, features
         return x

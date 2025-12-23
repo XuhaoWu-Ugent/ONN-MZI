@@ -35,8 +35,26 @@ class ResNet18MNIST(nn.Module):
         # Modify FC layer
         self.model.fc = nn.Linear(self.model.fc.in_features, num_classes)
 
-    def forward(self, x):
-        return self.model(x)
+    def forward(self, x, return_features=False):
+        # Step through the model to capture features before FC
+        x = self.model.conv1(x)
+        x = self.model.bn1(x)
+        x = self.model.relu(x)
+        x = self.model.maxpool(x)
+
+        x = self.model.layer1(x)
+        x = self.model.layer2(x)
+        x = self.model.layer3(x)
+        x = self.model.layer4(x)
+
+        features = self.model.avgpool(x)
+        
+        x = torch.flatten(features, 1)
+        logits = self.model.fc(x)
+        
+        if return_features:
+            return logits, features
+        return logits
 
 # === 2. Dynamic Noise Class ===
 class DynamicGaussianNoise(object):
@@ -155,42 +173,36 @@ def distillation_loss(student_logits, teacher_logits, temperature=4.0, alpha=0.5
 
 # === 5. Main Distillation Function ===
 def train_distill(student, teacher, device, train_loader, optimizer, epoch, scaler, args,
-                  noise_transform, current_sigma, scheduler=None, rank=0):
+                  noise_transform, current_sigma, feature_adapter, scheduler=None, rank=0):
     student.train()
-    teacher.eval() # Teacher is always in eval mode
+    feature_adapter.train() # Adapter is trainable
+    teacher.eval()
     
     epoch_loss = 0.0
     epoch_correct = 0
     total_samples = 0
     
-    # Standard CE for Hard Labels
     criterion_ce = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
+    criterion_feat = torch.nn.MSELoss() # Feature alignment loss
     
-    # Distillation Hyperparams
     TEMP = 4.0
-    # Read ALPHA from environment variable if available, else default to 0.5
     ALPHA = float(os.environ.get('DISTILL_ALPHA', 0.5))
+    BETA = float(os.environ.get('DISTILL_BETA', 1.0))
     
     for batch_idx, (data, target) in enumerate(train_loader):
         data, target = data.to(device), target.to(device)
         
         # --- Data Preparation ---
         with torch.no_grad():
-            # [CRITICAL UPDATE] Resolution Matching
-            # 1. First, downsample to Student's resolution (e.g., 14x14) to simulate information loss.
-            #    This forces the Teacher to form opinions based ONLY on features the Student can actually see.
             low_res_data = F.interpolate(data, size=(args.input_size, args.input_size), mode='bilinear', align_corners=False)
-            
-            # 2. Then upscale to 32x32 because ResNet expects larger inputs.
-            #    The image is now "blurry" (32x32 pixels, but only 14x14 effective info).
             teacher_input = F.interpolate(low_res_data, size=(32, 32), mode='bilinear', align_corners=False)
             
-            teacher_logits = teacher(teacher_input)
+            # Get Teacher Logits AND Features
+            teacher_logits, teacher_feat = teacher(teacher_input, return_features=True)
+            # teacher_feat shape: [batch, 512, 1, 1] -> Flatten to [batch, 512]
+            teacher_feat = torch.flatten(teacher_feat, 1)
 
-        # 3. Noisy Data for Student (Start from the same low_res_data)
         student_input = low_res_data.clone()
-        
-        # Add Noise
         if current_sigma > 0:
             student_input = student_input + torch.randn_like(student_input) * current_sigma
         
@@ -198,14 +210,19 @@ def train_distill(student, teacher, device, train_loader, optimizer, epoch, scal
         
         use_cuda = not args.no_cuda and torch.cuda.is_available()
         with autocast("cuda" if use_cuda else "cpu"):
-            student_logits = student(student_input)
+            # Get Student Logits AND Features
+            student_logits, student_feat = student(student_input, return_features=True)
+            
+            # Align Features: Student(1728) -> Adapter -> 512
+            student_feat_adapted = feature_adapter(student_feat)
             
             # Calculate Losses
             loss_ce = criterion_ce(student_logits, target)
             loss_kd = distillation_loss(student_logits, teacher_logits, temperature=TEMP)
+            loss_feat = criterion_feat(student_feat_adapted, teacher_feat)
             
-            # Combined Loss
-            loss = (1.0 - ALPHA) * loss_ce + ALPHA * loss_kd
+            # Combined Loss: (1-a)*CE + a*KD + b*Feat
+            loss = (1.0 - ALPHA) * loss_ce + ALPHA * loss_kd + BETA * loss_feat
             
         scaler.scale(loss).backward()
         scaler.unscale_(optimizer)
@@ -222,7 +239,6 @@ def train_distill(student, teacher, device, train_loader, optimizer, epoch, scal
         if batch_idx % args.log_interval == 0 and rank == 0:
             acc = 100. * epoch_correct / total_samples
             
-            # Fix Distributed Logging: Show local dataset size (15000) instead of global (60000)
             if dist.is_initialized() and hasattr(train_loader, 'sampler'):
                 dataset_size = len(train_loader.sampler)
             else:
@@ -230,7 +246,8 @@ def train_distill(student, teacher, device, train_loader, optimizer, epoch, scal
                 
             print(f'Train Epoch: {epoch} [{batch_idx * len(data)}/{dataset_size} '
                   f'({100. * batch_idx / len(train_loader):.0f}%)]\t'
-                  f'Loss: {loss.item():.6f} (CE:{loss_ce.item():.2f}, KD:{loss_kd.item():.2f})\tAcc: {acc:.2f}%')
+                  f'Loss: {loss.item():.4f} (CE:{loss_ce.item():.2f}, KD:{loss_kd.item():.2f}, FT:{loss_feat.item():.4f})\t'
+                  f'Acc: {acc:.2f}%')
 
     return epoch_loss / total_samples, 100. * epoch_correct / total_samples
 
@@ -368,10 +385,20 @@ def main():
     
     load_mzi_parameters_from_json(student, 'results/mzi_parameters.json')
 
+    # === 3. Feature Adapter (for Feature Alignment) ===
+    # Student features (after CNN layers) are 1728 (12*12*12).
+    # Teacher features (ResNet18 avgpool) are 512.
+    feature_adapter = nn.Linear(student.feature_size, 512).to(device)
+    
     if is_distributed:
         student = DDP(student, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
+        feature_adapter = DDP(feature_adapter, device_ids=[local_rank], output_device=local_rank)
 
-    optimizer = torch.optim.Adam(student.parameters(), lr=args.lr, weight_decay=1e-5)
+    # Add adapter to optimizer
+    optimizer = torch.optim.Adam(
+        list(student.parameters()) + list(feature_adapter.parameters()), 
+        lr=args.lr, weight_decay=1e-5
+    )
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer, max_lr=args.lr, steps_per_epoch=len(train_loader), 
         epochs=args.epochs, pct_start=0.2
@@ -379,9 +406,13 @@ def main():
     scaler = GradScaler()
     best_test_accuracy = 0.0
     
+    # Read BETA from env
+    BETA = float(os.environ.get('DISTILL_BETA', 1.0))
+
     if rank == 0:
         print(f"\n[Distillation] Starting Training. Teacher: ResNet18, Student: ONN (K={args.num_shared_weights})")
         print(f"[Distillation] Input Noise Sigma Target: {args.input_noise_sigma}")
+        print(f"[Distillation] Distillation Alpha: {os.environ.get('DISTILL_ALPHA', '0.5')}, Beta (Feature): {BETA}")
 
     # === Training Loop ===
     for epoch in range(1, args.epochs + 1):
@@ -396,7 +427,7 @@ def main():
             print(f"\n>>> Epoch {epoch} | Distilling with Input Noise: {curr_sigma:.4f}")
 
         train_distill(student, teacher, device, train_loader, optimizer, epoch, scaler, args,
-                      test_noise_transform, curr_sigma, scheduler, rank)
+                      test_noise_transform, curr_sigma, feature_adapter, scheduler, rank)
         
         # Test (using Ensemble)
         test_loss, test_acc = test_ensemble(student, device, test_loader, args, rank, num_repeats=5)
