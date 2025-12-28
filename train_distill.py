@@ -165,17 +165,14 @@ def distillation_loss(student_logits, teacher_logits, temperature=4.0, alpha=0.5
     student_log_softmax = F.log_softmax(student_logits / temperature, dim=1)
     
     # KL Divergence
-    # We REMOVE (temperature ** 2) scaling here to keep loss magnitude comparable to CE.
-    # This is often more stable for hardware-constrained networks.
     distill_loss = F.kl_div(student_log_softmax, soft_targets, reduction='batchmean')
-    
     return distill_loss
 
-# === 5. Main Distillation Function ===
+# === 5. Main Distillation Function (Updated for Weight Noise) ===
 def train_distill(student, teacher, device, train_loader, optimizer, epoch, scaler, args,
                   noise_transform, current_sigma, feature_adapter, scheduler=None, rank=0):
     student.train()
-    feature_adapter.train() # Adapter is trainable
+    feature_adapter.train() 
     teacher.eval()
     
     epoch_loss = 0.0
@@ -183,12 +180,17 @@ def train_distill(student, teacher, device, train_loader, optimizer, epoch, scal
     total_samples = 0
     
     criterion_ce = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
-    criterion_feat = torch.nn.MSELoss() # Feature alignment loss
+    criterion_feat = torch.nn.MSELoss() 
     
     TEMP = 4.0
     ALPHA = float(os.environ.get('DISTILL_ALPHA', 0.5))
     BETA = float(os.environ.get('DISTILL_BETA', 1.0))
     
+    # === Weight Noise Config ===
+    sigma_weight = args.weight_noise_sigma
+    if rank == 0 and epoch == 1 and sigma_weight > 0:
+        print(f"[Distill] Weight Noise Injection Enabled: sigma={sigma_weight}")
+
     for batch_idx, (data, target) in enumerate(train_loader):
         data, target = data.to(device), target.to(device)
         
@@ -199,7 +201,6 @@ def train_distill(student, teacher, device, train_loader, optimizer, epoch, scal
             
             # Get Teacher Logits AND Features
             teacher_logits, teacher_feat = teacher(teacher_input, return_features=True)
-            # teacher_feat shape: [batch, 512, 1, 1] -> Flatten to [batch, 512]
             teacher_feat = torch.flatten(teacher_feat, 1)
 
         student_input = low_res_data.clone()
@@ -208,15 +209,23 @@ def train_distill(student, teacher, device, train_loader, optimizer, epoch, scal
         
         optimizer.zero_grad()
         
+        # === 1. Inject Weight Noise (ADDED) ===
+        saved_params = {}
+        if sigma_weight > 0:
+            for name, param in student.named_parameters():
+                if param.requires_grad:
+                    saved_params[name] = param.data.clone()
+                    noise = torch.randn_like(param) * sigma_weight
+                    param.data.add_(noise)
+        # ======================================
+        
         use_cuda = not args.no_cuda and torch.cuda.is_available()
         with autocast("cuda" if use_cuda else "cpu"):
             # Get Student Logits AND Features
             student_logits, student_feat = student(student_input, return_features=True)
-            
-            # Flatten Student Features
             student_feat = torch.flatten(student_feat, 1)
 
-            # Align Features: Student(1728) -> Adapter -> 512
+            # Align Features
             student_feat_adapted = feature_adapter(student_feat)
             
             # Calculate Losses
@@ -224,10 +233,17 @@ def train_distill(student, teacher, device, train_loader, optimizer, epoch, scal
             loss_kd = distillation_loss(student_logits, teacher_logits, temperature=TEMP)
             loss_feat = criterion_feat(student_feat_adapted, teacher_feat)
             
-            # Combined Loss: (1-a)*CE + a*KD + b*Feat
             loss = (1.0 - ALPHA) * loss_ce + ALPHA * loss_kd + BETA * loss_feat
             
         scaler.scale(loss).backward()
+        
+        # === 2. Restore Clean Weights (ADDED) ===
+        if sigma_weight > 0:
+            for name, param in student.named_parameters():
+                if param.requires_grad:
+                    param.data.copy_(saved_params[name])
+        # ========================================
+
         scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(student.parameters(), max_norm=args.grad_clip)
         scaler.step(optimizer)
@@ -241,20 +257,14 @@ def train_distill(student, teacher, device, train_loader, optimizer, epoch, scal
 
         if batch_idx % args.log_interval == 0 and rank == 0:
             acc = 100. * epoch_correct / total_samples
-            
-            if dist.is_initialized() and hasattr(train_loader, 'sampler'):
-                dataset_size = len(train_loader.sampler)
-            else:
-                dataset_size = len(train_loader.dataset)
-                
-            print(f'Train Epoch: {epoch} [{batch_idx * len(data)}/{dataset_size} '
-                  f'({100. * batch_idx / len(train_loader):.0f}%)]\t'
-                  f'Loss: {loss.item():.4f} (CE:{loss_ce.item():.2f}, KD:{loss_kd.item():.2f}, FT:{loss_feat.item():.4f})\t'
-                  f'Acc: {acc:.2f}%')
+            # ... (log code) ...
+            if batch_idx % 100 == 0:
+                 print(f'Train Epoch: {epoch} [{batch_idx * len(data)}/{len(train_loader.dataset)}]\t'
+                  f'Loss: {loss.item():.4f}\tAcc: {acc:.2f}%')
 
     return epoch_loss / total_samples, 100. * epoch_correct / total_samples
 
-# === 6. Ensemble Test (Same as before) ===
+# === 6. Ensemble Test (Updated for Weight Noise) ===
 def test_ensemble(model, device, test_loader, args, rank=0, num_repeats=5):
     model.eval()
     test_loss = 0
@@ -263,6 +273,14 @@ def test_ensemble(model, device, test_loader, args, rank=0, num_repeats=5):
     # Prepare resizing transform
     resize = transforms.Resize((args.input_size, args.input_size))
     
+    # Weight Noise Config for Test
+    sigma_weight = args.weight_noise_sigma
+    original_weights = {}
+    if sigma_weight > 0:
+        for name, p in model.named_parameters():
+             if p.requires_grad:
+                original_weights[name] = p.data.clone()
+
     with torch.no_grad():
         for data, target in test_loader:
             data, target = data.to(device), target.to(device)
@@ -271,9 +289,23 @@ def test_ensemble(model, device, test_loader, args, rank=0, num_repeats=5):
             
             output_sum = None
             for _ in range(num_repeats):
+                # === Inject Dynamic Weight Noise for Ensemble (ADDED) ===
+                if sigma_weight > 0:
+                    for name, param in model.named_parameters():
+                        if param.requires_grad:
+                            noise = torch.randn_like(param) * sigma_weight
+                            param.data.copy_(original_weights[name] + noise)
+                # ========================================================
+                
                 output = model(data_onn)
                 if output_sum is None: output_sum = output
                 else: output_sum += output
+
+            # Restore clean weights for next batch (or end of test)
+            if sigma_weight > 0:
+                for name, param in model.named_parameters():
+                    if param.requires_grad:
+                        param.data.copy_(original_weights[name])
             
             output_avg = output_sum / num_repeats
             test_loss += F.cross_entropy(output_avg, target, reduction='sum').item()
@@ -298,7 +330,6 @@ def test_ensemble(model, device, test_loader, args, rank=0, num_repeats=5):
 def load_mzi_parameters_from_json(model, json_path):
     if not os.path.exists(json_path): return
     with open(json_path, 'r') as f: mzi_params = json.load(f)
-    
     def load_mzi_layer_params(mzi_layer):
         if hasattr(mzi_layer, 'MZI'):
             for mzi in mzi_layer.MZI:
@@ -309,7 +340,6 @@ def load_mzi_parameters_from_json(model, json_path):
                         params = mzi_params[param_key]
                         mzi.load_physical_parameters(a=params['a'], b=params['b'], delta_r=params['delta_r'], phi0=params['phi0'])
                         mzi.freeze_fabrication_parameters()
-
     for layer in model.layers:
         if isinstance(layer, CNN_layer):
             for f in layer.filters:
@@ -318,7 +348,6 @@ def load_mzi_parameters_from_json(model, json_path):
         for path in ['pos_encoder_slices', 'neg_encoder_slices', 'pos_decoder_slice', 'neg_decoder_slice']:
             if hasattr(model.fc, path):
                 module = getattr(model.fc, path)
-                # module might be ModuleList or Module
                 if isinstance(module, nn.ModuleList):
                     for p in module: 
                         for ml in p.layers: load_mzi_layer_params(ml)
@@ -345,8 +374,7 @@ def main():
     np.random.seed(args.seed + rank)
     torch.manual_seed(args.seed + rank)
     
-    # === Loaders (Raw 28x28 for Teacher, will resize in loop) ===
-    # We use basic normalization here
+    # === Loaders ===
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.1307,), (0.3081,))
@@ -388,16 +416,13 @@ def main():
     
     load_mzi_parameters_from_json(student, 'results/mzi_parameters.json')
 
-    # === 3. Feature Adapter (for Feature Alignment) ===
-    # Student features (after CNN layers) are 1728 (12*12*12).
-    # Teacher features (ResNet18 avgpool) are 512.
+    # === 3. Feature Adapter ===
     feature_adapter = nn.Linear(student.feature_size, 512).to(device)
     
     if is_distributed:
         student = DDP(student, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
         feature_adapter = DDP(feature_adapter, device_ids=[local_rank], output_device=local_rank)
 
-    # Add adapter to optimizer
     optimizer = torch.optim.Adam(
         list(student.parameters()) + list(feature_adapter.parameters()), 
         lr=args.lr, weight_decay=1e-5
@@ -409,19 +434,19 @@ def main():
     scaler = GradScaler()
     best_test_accuracy = 0.0
     
-    # Read BETA from env
     BETA = float(os.environ.get('DISTILL_BETA', 1.0))
 
     if rank == 0:
         print(f"\n[Distillation] Starting Training. Teacher: ResNet18, Student: ONN (K={args.num_shared_weights})")
         print(f"[Distillation] Input Noise Sigma Target: {args.input_noise_sigma}")
-        print(f"[Distillation] Distillation Alpha: {os.environ.get('DISTILL_ALPHA', '0.5')}, Beta (Feature): {BETA}")
+        if args.weight_noise_sigma > 0:
+            print(f"[Distillation] Weight Noise Sigma: {args.weight_noise_sigma}")
 
     # === Training Loop ===
     for epoch in range(1, args.epochs + 1):
         if is_distributed: train_sampler.set_epoch(epoch)
         
-        # Annealing Sigma
+        # Annealing Input Noise (unchanged)
         if epoch <= 5: curr_sigma = 0.0
         elif epoch <= 15: curr_sigma = args.input_noise_sigma * ((epoch - 5) / 10.0)
         else: curr_sigma = args.input_noise_sigma
@@ -429,20 +454,18 @@ def main():
         if rank == 0:
             print(f"\n>>> Epoch {epoch} | Distilling with Input Noise: {curr_sigma:.4f}")
 
+        # Train (now with weight noise support)
         train_distill(student, teacher, device, train_loader, optimizer, epoch, scaler, args,
                       test_noise_transform, curr_sigma, feature_adapter, scheduler, rank)
         
-        # Test (using Ensemble)
+        # Test (now with weight noise support)
         test_loss, test_acc = test_ensemble(student, device, test_loader, args, rank, num_repeats=5)
 
         if rank == 0 and test_acc > best_test_accuracy:
             best_test_accuracy = test_acc
             model_to_save = student.module if is_distributed else student
-            
-            # Allow custom suffix for parameter sweeps
             suffix = os.environ.get('SAVE_SUFFIX', '')
             save_name = f"distilled_shared_K{args.num_shared_weights}{suffix}_best.pt"
-            
             torch.save(model_to_save.state_dict(), save_name)
             print(f"[Best Student Updated] Acc: {test_acc:.2f}% (Saved to {save_name})")
 
