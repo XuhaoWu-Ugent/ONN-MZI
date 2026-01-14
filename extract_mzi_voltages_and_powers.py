@@ -52,7 +52,9 @@ def collect_hardware_data():
     ).to(device)
 
     # 2. Load the best weights
-    checkpoint_path = f"distilled_shared_K{args.num_shared_weights}_alpha0.5_sigma0.15_best.pt"
+    checkpoint_path = f"distilled_shared_K{args.num_shared_weights}_full_distill_best.pt"
+    if not os.path.exists(checkpoint_path):
+        checkpoint_path = f"distilled_shared_K{args.num_shared_weights}_alpha0.5_sigma0.15_best.pt"
     if not os.path.exists(checkpoint_path):
         checkpoint_path = f"distilled_shared_K{args.num_shared_weights}_best.pt"
     if not os.path.exists(checkpoint_path):
@@ -167,7 +169,7 @@ def collect_hardware_data():
         results['fc'] = fc_res
 
     # 7. Save
-    save_path = f"results/mzi_hardware_data_K{args.num_shared_weights}.npy"
+    save_path = f"results/mzi_hardware_data_K{args.num_shared_weights}_full_distill.npy"
     np.save(save_path, results)
     print(f"\n{'='*60}")
     print(f"Hardware snapshot saved to: {save_path}")

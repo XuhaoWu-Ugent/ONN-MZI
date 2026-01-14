@@ -49,6 +49,6 @@ if __name__ == '__main__':
     # input_npy_file = os.path.join(base_dir, 'filter_data', 'hook_data_verified.npy')
     # output_json_file = os.path.join(base_dir, 'filter_data', 'hook_data_verified.json')
     
-    input_npy_file = os.path.join(base_dir, 'results', 'mzi_hardware_data_K15.npy')
-    output_json_file = os.path.join(base_dir, 'results', 'mzi_hardware_data_K15.json')
+    input_npy_file = os.path.join(base_dir, 'results', 'mzi_hardware_data_K15_full_distill.npy')
+    output_json_file = os.path.join(base_dir, 'results', 'mzi_hardware_data_K15_full_distill.json')
     convert_npy_to_json(input_npy_file, output_json_file)

@@ -209,11 +209,11 @@ def train_distill(student, teacher, device, train_loader, optimizer, epoch, scal
         
         optimizer.zero_grad()
         
-        # === 1. Inject Weight Noise (ADDED) ===
+        # === 1. Inject Voltage Noise (Physical MZI Channels) ===
         saved_params = {}
         if sigma_weight > 0:
             for name, param in student.named_parameters():
-                if param.requires_grad:
+                if param.requires_grad and "_voltage" in name:
                     saved_params[name] = param.data.clone()
                     noise = torch.randn_like(param) * sigma_weight
                     param.data.add_(noise)
@@ -240,7 +240,7 @@ def train_distill(student, teacher, device, train_loader, optimizer, epoch, scal
         # === 2. Restore Clean Weights (ADDED) ===
         if sigma_weight > 0:
             for name, param in student.named_parameters():
-                if param.requires_grad:
+                if param.requires_grad and "_voltage" in name:
                     param.data.copy_(saved_params[name])
         # ========================================
 
@@ -289,10 +289,10 @@ def test_ensemble(model, device, test_loader, args, rank=0, num_repeats=5):
             
             output_sum = None
             for _ in range(num_repeats):
-                # === Inject Dynamic Weight Noise for Ensemble (ADDED) ===
+                # === Inject Voltage Noise for Ensemble (Physical MZI Channels) ===
                 if sigma_weight > 0:
                     for name, param in model.named_parameters():
-                        if param.requires_grad:
+                        if param.requires_grad and "_voltage" in name:
                             noise = torch.randn_like(param) * sigma_weight
                             param.data.copy_(original_weights[name] + noise)
                 # ========================================================
