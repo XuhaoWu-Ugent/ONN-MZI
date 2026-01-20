@@ -165,7 +165,8 @@ def main():
                 best_test_accuracy = test_acc
                 if args.save_model:
                     model_to_save = model.module if is_distributed else model
-                    torch.save(model_to_save.state_dict(), f"optimized_shared_K{args.num_shared_weights}_best.pt")
+                    save_suffix = os.environ.get('SAVE_SUFFIX', '')
+                    torch.save(model_to_save.state_dict(), f"optimized_shared_K{args.num_shared_weights}_ch{args.hidden_channels}{save_suffix}_best.pt")
                     print(f"[Best Model Updated] Acc: {test_acc:.2f}%")
 
     if rank == 0 and args.wandb:

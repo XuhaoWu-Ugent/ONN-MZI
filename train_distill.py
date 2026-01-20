@@ -465,7 +465,7 @@ def main():
             best_test_accuracy = test_acc
             model_to_save = student.module if is_distributed else student
             suffix = os.environ.get('SAVE_SUFFIX', '')
-            save_name = f"distilled_shared_K{args.num_shared_weights}{suffix}_best.pt"
+            save_name = f"distilled_shared_K{args.num_shared_weights}_ch{args.hidden_channels}{suffix}_best.pt"
             torch.save(model_to_save.state_dict(), save_name)
             print(f"[Best Student Updated] Acc: {test_acc:.2f}% (Saved to {save_name})")
 
