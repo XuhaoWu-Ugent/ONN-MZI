@@ -182,6 +182,11 @@ class OpticalLoRALinear(nn.Module):
 
         # Trainable Bias (Initialized randomly to break symmetry)
         self.bias = nn.Parameter(torch.randn(r) * 0.1)
+
+        # Hook data for FC input (needed for hardware extraction)
+        self._fc_input_hook = None
+        self._enable_fc_input_hook = False
+
         self._print_architecture()
 
     def _print_architecture(self):
@@ -201,31 +206,9 @@ class OpticalLoRALinear(nn.Module):
             self.pos_decoder_slice.clear_cache()
             self.neg_decoder_slice.clear_cache()
 
-        # === POSITIVE PATH ===
-        pos_hidden = self.forward_encoder(x, self.pos_encoder_slices)
-        pos_output = self.forward_decoder(pos_hidden, self.pos_decoder_slice)
-
-        if self.pos_only:
-            output = pos_output + self.bias
-        else:
-            # === NEGATIVE PATH ===
-            neg_hidden = self.forward_encoder(x, self.neg_encoder_slices)
-            neg_output = self.forward_decoder(neg_hidden, self.neg_decoder_slice)
-
-            # === DIFFERENTIAL OUTPUT ===
-            output = (pos_output - neg_output) + self.bias
-
-        if self.output_proj is not None:
-            output = self.output_proj(output)
-
-        return output
-    
-    def forward(self, x):
-        if self.training:
-            for p in self.pos_encoder_slices: p.clear_cache()
-            for p in self.neg_encoder_slices: p.clear_cache()
-            self.pos_decoder_slice.clear_cache()
-            self.neg_decoder_slice.clear_cache()
+        # Record FC input for hardware extraction
+        if self._enable_fc_input_hook:
+            self._fc_input_hook = x.detach().cpu().clone()
 
         # === POSITIVE PATH ===
         pos_hidden = self.forward_encoder(x, self.pos_encoder_slices)
@@ -326,16 +309,22 @@ class OpticalLoRALinear(nn.Module):
 
     # Hooks (Simplified for brevity, records physical processors)
     def enable_hooks(self):
+        self._enable_fc_input_hook = True
         for p in self.pos_encoder_slices: p.enable_hook = True
         for p in self.neg_encoder_slices: p.enable_hook = True
         self.pos_decoder_slice.enable_hook = True
         self.neg_decoder_slice.enable_hook = True
 
     def disable_hooks(self):
+        self._enable_fc_input_hook = False
         for p in self.pos_encoder_slices: p.enable_hook = False
         for p in self.neg_encoder_slices: p.enable_hook = False
         self.pos_decoder_slice.enable_hook = False
         self.neg_decoder_slice.enable_hook = False
+
+    def get_fc_input(self):
+        """Get the recorded FC input for hardware extraction."""
+        return self._fc_input_hook
 
     def get_hook_data(self):
         # ... Implementation similar to benchmark but iterates over physical processors ...
