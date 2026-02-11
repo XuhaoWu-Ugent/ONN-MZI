@@ -32,7 +32,8 @@ class CNN_layer(nn.Module):
     """
 
     def __init__(self, in_channels, out_channels, kernel_size, mzi_repeat_num,
-                 mzi_row_num, mzi_column_num, detection_mode='coherent'):
+                 mzi_row_num, mzi_column_num, detection_mode='coherent',
+                 input_phase_noise_sigma=0.0):
         """
         Initialize CNN layer with optical filters
 
@@ -44,6 +45,7 @@ class CNN_layer(nn.Module):
             mzi_row_num (int): Number of MZIs per row
             mzi_column_num (int): Number of MZIs per column
             detection_mode (str): 'coherent' or 'power', default 'coherent'
+            input_phase_noise_sigma (float): Std of input phase noise in radians, default 0.0
 
         Note:
             out_channels must be divisible by in_channels for proper filter distribution
@@ -72,7 +74,8 @@ class CNN_layer(nn.Module):
                 repeat_num=mzi_repeat_num,
                 mzi_row_num=mzi_row_num,
                 mzi_column_num=mzi_column_num,
-                detection_mode=detection_mode
+                detection_mode=detection_mode,
+                input_phase_noise_sigma=input_phase_noise_sigma
             )
             for _ in range(out_channels)
         ])

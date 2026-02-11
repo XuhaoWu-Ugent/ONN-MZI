@@ -22,8 +22,8 @@ class SingleChannelFilter(nn.Module):
     """
     
     def __init__(self, mzi_row_num=5, mzi_column_num=4, repeat_num=5, kernel_size=3,
-                 detection_mode='coherent'):
-        
+                 detection_mode='coherent', input_phase_noise_sigma=0.0):
+
         """
         Initialize single channel filter with configurable detection mode
 
@@ -33,6 +33,7 @@ class SingleChannelFilter(nn.Module):
             repeat_num (int): Number of MZI layer repetitions, default 5
             kernel_size (int): Size of the convolution kernel, default 3
             detection_mode (str): 'coherent' or 'power', default 'coherent'
+            input_phase_noise_sigma (float): Std of input phase noise in radians, default 0.0
         """
         super(SingleChannelFilter, self).__init__()
 
@@ -46,6 +47,7 @@ class SingleChannelFilter(nn.Module):
         self.repeat_num = repeat_num
         self.kernel_size = kernel_size
         self.detection_mode = detection_mode
+        self.input_phase_noise_sigma = input_phase_noise_sigma
         self.num_ports = mzi_row_num * 2  # 10 ports for compatibility
 
         # Create alternating row and column MZI layers with global indexing
@@ -98,18 +100,34 @@ class SingleChannelFilter(nn.Module):
         # === HOOK MECHANISM ===
         self.enable_hook = False
         self.hook_data = {
-            'optical_input': None, 
-            'optical_output': None, 
+            'optical_input': None,
+            'optical_output': None,
             'mzi_voltages': None
         }
+
+        # === PHASE NOISE CONTROL ===
+        self._eval_phase_noise = False  # Whether to inject phase noise in eval mode
 
     # === Hook Methods ===
     def enable_hooks(self):
         self.enable_hook = True
-        
+
     def disable_hooks(self):
         self.enable_hook = False
         self.hook_data = {'optical_input': None, 'optical_output': None, 'mzi_voltages': None}
+
+    # === Phase Noise Control ===
+    def set_input_phase_noise(self, sigma: float):
+        """Set input phase noise sigma (in radians)"""
+        self.input_phase_noise_sigma = sigma
+
+    def enable_eval_phase_noise(self):
+        """Enable phase noise injection even in eval mode (for testing)"""
+        self._eval_phase_noise = True
+
+    def disable_eval_phase_noise(self):
+        """Disable phase noise injection in eval mode"""
+        self._eval_phase_noise = False
 
     def _prepare_voltages(
         self,
@@ -333,6 +351,15 @@ class SingleChannelFilter(nn.Module):
 
         # Convert to complex type for MZI processing
         patches = patches.to(torch.complex64)
+
+        # Inject input phase noise (simulates fiber-induced phase fluctuations)
+        # Active during training, or in eval mode if explicitly enabled
+        should_inject_noise = self.input_phase_noise_sigma > 0 and (
+            self.training or self._eval_phase_noise
+        )
+        if should_inject_noise:
+            phase_noise = torch.randn(patches.shape, device=patches.device) * self.input_phase_noise_sigma
+            patches = patches * torch.exp(1j * phase_noise)
 
         # Resolve per-batch voltages
         voltage_batch = self._prepare_voltages(voltages, batch_size, patches.device)

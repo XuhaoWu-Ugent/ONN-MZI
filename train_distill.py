@@ -411,7 +411,8 @@ def main():
         mzi_row_num=args.mzi_row_num, mzi_column_num=args.mzi_column_num,
         detection_mode=args.detection_mode, use_optical_fc=args.use_optical_fc,
         fc_activation_mode=args.fc_activation_mode, num_shared_weights=args.num_shared_weights,
-        fc_pos_only=args.fc_pos_only
+        fc_pos_only=args.fc_pos_only,
+        input_phase_noise_sigma=args.input_phase_noise_sigma
     ).to(device)
     
     load_mzi_parameters_from_json(student, 'results/mzi_parameters.json')

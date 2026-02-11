@@ -14,14 +14,16 @@ class OpticalNetwork(nn.Module):
     def __init__(self, input_channels, hidden_channels, output_size, mzi_repeat_num,
                  mzi_row_num, mzi_column_num, num_layers=4, input_size=14, kernel_size=3,
                  detection_mode='coherent', use_optical_fc=True, fc_activation_mode='linear',
-                 num_shared_weights=None, fc_pos_only: bool = False): # New parameter
+                 num_shared_weights=None, fc_pos_only: bool = False,
+                 input_phase_noise_sigma: float = 0.0):
         """
         Initialize the Optical Neural Network (Shared Weights)
 
         Args:
             ...
-            num_shared_weights (int): Number of shared MZI processors for the FC layer. 
+            num_shared_weights (int): Number of shared MZI processors for the FC layer.
                                       If None, uses full independent processors.
+            input_phase_noise_sigma (float): Std of input phase noise in radians for CNN filters.
         """
         super(OpticalNetwork, self).__init__()
 
@@ -37,6 +39,7 @@ class OpticalNetwork(nn.Module):
         self.mzi_column_num = mzi_column_num
         self.num_shared_weights = num_shared_weights
         self.fc_pos_only = fc_pos_only
+        self.input_phase_noise_sigma = input_phase_noise_sigma
 
         # Initialize network components
         self.layers = nn.ModuleList()
@@ -58,7 +61,8 @@ class OpticalNetwork(nn.Module):
                 mzi_repeat_num,
                 mzi_row_num,
                 mzi_column_num,
-                detection_mode=detection_mode
+                detection_mode=detection_mode,
+                input_phase_noise_sigma=input_phase_noise_sigma
             ))
             self.bns.append(nn.BatchNorm2d(out_channels))
 

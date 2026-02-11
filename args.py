@@ -97,6 +97,8 @@ def get_args():
                             help='Standard deviation of Gaussian noise added to weights during training')
     train_group.add_argument('--input-noise-sigma', type=float, default=0.0,
                             help='Standard deviation of Gaussian noise added to input data during training')
+    train_group.add_argument('--input-phase-noise-sigma', type=float, default=0.0,
+                            help='Standard deviation of input phase noise in radians (simulates fiber-induced phase fluctuations)')
 
     # System Parameters
     sys_group = parser.add_argument_group('System Configuration')
