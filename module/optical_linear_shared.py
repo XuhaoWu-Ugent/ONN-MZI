@@ -234,69 +234,75 @@ class OpticalLoRALinear(nn.Module):
         device = x.device
         num_slices = self.n_slices
         num_physical_processors = len(slice_processors)
-        
-        # Step 1: Padding
+
+        # Step 1: Padding  (576 -> 580, so N=58 slices of r=10)
         if self.padded_in > self.in_features:
             x = F.pad(x, (0, self.padded_in - self.in_features))
 
-        # Step 2: Reshape
+        # Step 2: Reshape into N slices  (B, 580) -> (B, 58, 10)
         x_sliced = x.view(batch_size, num_slices, self.r)
 
-        # Step 3: Collect Physical Matrices [K, 20, 20]
+        # Step 3: Collect K Physical Matrices [K, 20, 20]
         matrices_list = [p._get_combined_matrix(device) for p in slice_processors]
         k_matrices = torch.stack(matrices_list)
 
         # === Hook: Record Physical Processor Data ===
-        # Since we use vectorized einsum, we manually trigger hooks for physical processors
         first_p = slice_processors[0]
         if first_p.enable_hook:
             for i, p in enumerate(slice_processors):
-                # Record Voltages
                 v_list = []
                 for layer in p.layers:
                     if hasattr(layer, 'MZI'):
                         for mzi in layer.MZI: v_list.append(mzi.get_voltage().item())
                 p.hook_data['mzi_voltages'] = torch.tensor(v_list)
-                
-                # Record Input (for physical processor i, we take the corresponding slice from batch)
-                # In shared mode, processor i handles multiple slices. We record the first occurrence.
                 p.hook_data['optical_input'] = x_sliced[:, i, :].detach().cpu().clone()
 
-        # Step 3.5: Expand to Logical Matrices [N, 20, 20]
+        # Step 3.5: Weight Sharing — expand K physical to N logical [N, 20, 20]
+        #   Slice i uses processor (i % K)
         if num_physical_processors < num_slices:
-            # Weight Sharing: Map N slices to K processors
             indices = torch.arange(num_slices, device=device) % num_physical_processors
             combined_matrices = k_matrices.index_select(0, indices)
         else:
             combined_matrices = k_matrices
 
-        # Step 4: Input Vector
-        x_amplitude = torch.sqrt(torch.abs(x_sliced) + 1e-8)
-        x_complex = x_amplitude.to(torch.complex64)
+        num_ports = first_p.num_ports      # 10
+        matrix_size = first_p.matrix_size  # 20
 
-        # Step 5: State Vectors
-        matrix_size = first_p.matrix_size
-        num_ports = first_p.num_ports
-        state_vectors = torch.zeros(batch_size, num_slices, matrix_size,
-                                  dtype=torch.complex64, device=device)
-        state_vectors[:, :, :num_ports] = x_complex
+        # Step 4-7: Detection-mode-dependent propagation through N slices
+        if self.detection_mode == 'power':
+            # ---- Power mode (incoherent): each port processed independently ----
+            # Extract T[s,j,i] = |M[s, 10+j, i]|^2  for all N slices
+            T_matrices = torch.abs(
+                combined_matrices[:, num_ports:2*num_ports, :num_ports]
+            ) ** 2  # (N, 10, 10)
 
-        # Step 6: Vectorized Matmul
-        new_states = torch.einsum('bsi, sji -> bsj', state_vectors, combined_matrices)
+            # Input power per slice: x_power[b,s,i] = |x_sliced[b,s,i]| + eps
+            x_power = torch.abs(x_sliced) + 1e-8  # (B, N, 10)
 
-        # Step 7: Output
-        output_complex = new_states[:, :, num_ports : 2*num_ports]
-        output_power = torch.abs(output_complex) ** 2
-        
+            # Power-mode output per slice: output[b,s,j] = Σ_i T[s,j,i] * x_power[b,s,i]
+            output_power = torch.einsum('bsi, sji -> bsj', x_power, T_matrices)  # (B, N, 10)
+        else:
+            # ---- Coherent mode: all inputs simultaneously ----
+            x_amplitude = torch.sqrt(torch.abs(x_sliced) + 1e-8)
+            x_complex = x_amplitude.to(torch.complex64)
+
+            state_vectors = torch.zeros(batch_size, num_slices, matrix_size,
+                                      dtype=torch.complex64, device=device)
+            state_vectors[:, :, :num_ports] = x_complex  # (B, N, 20)
+
+            new_states = torch.einsum('bsi, sji -> bsj', state_vectors, combined_matrices)
+            output_complex = new_states[:, :, num_ports:2*num_ports]  # (B, N, 10)
+            output_power = torch.abs(output_complex) ** 2
+
         # === Hook: Record Physical Output Power ===
         if first_p.enable_hook:
             for i, p in enumerate(slice_processors):
-                # Again, record the output of the first slice handled by this processor
                 p.hook_data['optical_output'] = output_power[:, i, :].detach().cpu().clone()
 
+        # Step 8: Sum over all N slices -> hidden (B, 10)
         hidden = output_power.sum(dim=1)
 
-        # Normalization
+        # Step 9: Normalization
         hidden = hidden / math.sqrt(self.n_slices)
 
         return hidden
