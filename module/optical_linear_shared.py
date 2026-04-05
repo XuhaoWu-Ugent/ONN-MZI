@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+from module.MZI_array.mzi import redheffer_star_product
 from module.MZI_array.mzi_row_array import MZIlayer_row
 from module.MZI_array.mzi_column_array import MZIlayer_column
 
@@ -57,10 +58,19 @@ class OpticalSliceProcessor(nn.Module):
         self._combined_matrix = None
 
     def _build_combined_matrix(self, device):
-        combined = torch.eye(self.matrix_size, dtype=torch.complex64, device=device)
-        for layer in reversed(self.layers):
+        N = self.num_ports  # single-side port count
+
+        # Redheffer identity: zero reflection, perfect transmission
+        combined = torch.zeros(
+            self.matrix_size, self.matrix_size,
+            dtype=torch.complex64, device=device,
+        )
+        combined[:N, N:] = torch.eye(N, dtype=torch.complex64, device=device)
+        combined[N:, :N] = torch.eye(N, dtype=torch.complex64, device=device)
+
+        for layer in self.layers:
             layer_matrix = layer._build_transfer_matrix(device)
-            combined = torch.matmul(layer_matrix, combined)
+            combined = redheffer_star_product(combined, layer_matrix, N)
         return combined
 
     def forward(self, x):

@@ -13,6 +13,148 @@ def _exp_neg_j(phi: torch.Tensor) -> torch.Tensor:
     return torch.complex(real, imag)
 
 
+def batch_mzi_transfer_matrices(
+    raw_a: torch.Tensor,
+    raw_b: torch.Tensor,
+    raw_delta_r: torch.Tensor,
+    raw_phi0: torch.Tensor,
+    voltage: torch.Tensor,
+    nominal_resistance: float,
+    p_pi: float,
+    alpha_amplitude: torch.Tensor,
+    epsilon: float = 1e-8,
+    orientation: str = "horizontal",
+) -> torch.Tensor:
+    """
+    Compute 4x4 scattering matrices for K MZIs in one vectorized pass.
+
+    Args:
+        raw_a, raw_b, raw_delta_r, raw_phi0: (K,) raw parameter tensors.
+        voltage: (K,) shared or (B, K) per-sample voltage tensor.
+        nominal_resistance, p_pi: scalar physical constants.
+        alpha_amplitude: scalar tensor (insertion-loss amplitude).
+        epsilon: numerical guard.
+        orientation: 'horizontal' or 'vertical'.
+
+    Returns:
+        (K, 4, 4) complex tensor if voltage is 1-D,
+        (B, K, 4, 4) complex tensor if voltage is 2-D.
+    """
+    guard = epsilon
+    # --- bounded parameter mappings (all shape (K,)) ---
+    a = 0.45 + 0.1 * torch.clamp(torch.sigmoid(raw_a), guard, 1.0 - guard)
+    b = 0.45 + 0.1 * torch.clamp(torch.sigmoid(raw_b), guard, 1.0 - guard)
+    delta_r = 50.0 * torch.tanh(raw_delta_r)
+    phi0 = math.pi * torch.tanh(raw_phi0)
+
+    dtype = a.dtype
+    device = a.device
+
+    resistance = torch.clamp(
+        torch.tensor(nominal_resistance, dtype=dtype, device=device) + delta_r,
+        min=1.0,
+    )  # (K,)
+
+    # delta_phi: (K,) or (B, K) depending on voltage shape
+    delta_phi = math.pi * (voltage ** 2) / (resistance * p_pi)
+
+    phi1 = 0.5 * phi0 + delta_phi     # (K,) or (B, K)
+    phi2 = -0.5 * phi0                 # (K,)
+
+    sqrt_ab = torch.sqrt(torch.clamp(a * b, min=epsilon))
+    sqrt_a_1b = torch.sqrt(torch.clamp(a * (1.0 - b), min=epsilon))
+    sqrt_b_1a = torch.sqrt(torch.clamp(b * (1.0 - a), min=epsilon))
+    sqrt_1a_1b = torch.sqrt(torch.clamp((1.0 - a) * (1.0 - b), min=epsilon))
+
+    exp_phi1 = _exp_neg_j(phi1)   # (K,) or (B, K)
+    exp_phi2 = _exp_neg_j(phi2)   # (K,)
+
+    alpha_c = torch.complex(
+        alpha_amplitude.to(dtype=dtype, device=device),
+        torch.zeros(1, dtype=dtype, device=device),
+    )
+    j_c = torch.complex(
+        torch.zeros(1, dtype=dtype, device=device),
+        torch.ones(1, dtype=dtype, device=device),
+    )
+
+    # S-parameters — all (K,) or (B, K) complex
+    S31 = alpha_c * (sqrt_1a_1b * exp_phi1 - sqrt_ab * exp_phi2)
+    S32 = -j_c * alpha_c * (sqrt_a_1b * exp_phi1 + sqrt_b_1a * exp_phi2)
+    S41 = -j_c * alpha_c * (sqrt_b_1a * exp_phi1 + sqrt_a_1b * exp_phi2)
+    S42 = alpha_c * (-sqrt_ab * exp_phi1 + sqrt_1a_1b * exp_phi2)
+
+    zero = torch.zeros_like(S31)
+
+    if orientation == "horizontal":
+        r0 = torch.stack([zero, zero, S31, S41], dim=-1)
+        r1 = torch.stack([zero, zero, S32, S42], dim=-1)
+        r2 = torch.stack([S31, S32, zero, zero], dim=-1)
+        r3 = torch.stack([S41, S42, zero, zero], dim=-1)
+    else:  # vertical
+        r0 = torch.stack([zero, S31, zero, S41], dim=-1)
+        r1 = torch.stack([S31, zero, S32, zero], dim=-1)
+        r2 = torch.stack([zero, S32, zero, S42], dim=-1)
+        r3 = torch.stack([S41, zero, S42, zero], dim=-1)
+
+    # (K, 4, 4) or (B, K, 4, 4)
+    return torch.stack([r0, r1, r2, r3], dim=-2)
+
+
+def redheffer_star_product(
+    S_A: torch.Tensor, S_B: torch.Tensor, N: int
+) -> torch.Tensor:
+    """
+    Cascade two 2N x 2N scattering matrices via the Redheffer star product.
+
+    Given:
+        S_A -- 2N x 2N S-matrix of upstream element (light hits A first)
+        S_B -- 2N x 2N S-matrix of downstream element
+        N   -- single-side port count (block size)
+
+    Each S-matrix is partitioned as::
+
+        [[S11, S12],   S11: N x N left-to-left   (back-reflection)
+         [S21, S22]]   S21: N x N left-to-right   (forward transmission)
+                       S12: N x N right-to-left   (reverse transmission)
+                       S22: N x N right-to-right  (back-reflection)
+
+    Returns:
+        2N x 2N cascaded S-matrix that accounts for all multiple reflections
+        between A's right interface and B's left interface (steady-state).
+
+    Fully differentiable (uses ``torch.linalg.solve``).
+    """
+    dtype = S_A.dtype
+    device = S_A.device
+
+    A11, A12 = S_A[:N, :N], S_A[:N, N:]
+    A21, A22 = S_A[N:, :N], S_A[N:, N:]
+    B11, B12 = S_B[:N, :N], S_B[:N, N:]
+    B21, B22 = S_B[N:, :N], S_B[N:, N:]
+
+    I = torch.eye(N, dtype=dtype, device=device)
+
+    lhs_F = I - A22 @ B11
+    lhs_G = I - B11 @ A22
+
+    F_A21 = torch.linalg.solve(lhs_F, A21)
+    F_A22_B12 = torch.linalg.solve(lhs_F, A22 @ B12)
+    G_B11_A21 = torch.linalg.solve(lhs_G, B11 @ A21)
+    G_B12 = torch.linalg.solve(lhs_G, B12)
+
+    S11 = A11 + A12 @ G_B11_A21
+    S12 = A12 @ G_B12
+    S21 = B21 @ F_A21
+    S22 = B22 + B21 @ F_A22_B12
+
+    return torch.cat(
+        [torch.cat([S11, S12], dim=-1),
+         torch.cat([S21, S22], dim=-1)],
+        dim=-2,
+    )
+
+
 class MZI(nn.Module):
     """
     Four-port Mach–Zehnder interferometer for CNN training with calibrated hardware.
@@ -36,10 +178,17 @@ class MZI(nn.Module):
         trainable_fabrication: bool = False,
         trainable_voltage: bool = True,
         lossless: bool = False,
+        orientation: str = "horizontal",
     ) -> None:
         super().__init__()
 
+        if orientation not in ("horizontal", "vertical"):
+            raise ValueError(
+                f"orientation must be 'horizontal' or 'vertical', got {orientation!r}"
+            )
+
         self.index = index
+        self.orientation = orientation
         self.nominal_resistance = float(nominal_resistance)
         self.p_pi = float(p_pi)
         self.epsilon = float(epsilon)
@@ -71,6 +220,7 @@ class MZI(nn.Module):
         parts = []
         if self.index is not None:
             parts.append(f"index={self.index}")
+        parts.append(f"orientation={self.orientation}")
         parts.append(f"trainable_voltage={self._voltage.requires_grad}")
         parts.append(f"trainable_fabrication={self._raw_a.requires_grad}")
         parts.append(f"lossless={self.lossless}")
@@ -269,17 +419,34 @@ class MZI(nn.Module):
         S42 = alpha * (-sqrt_ab * exp_phi1 + sqrt_1a_1b * exp_phi2)
         
         zero = torch.zeros_like(S31)
-        
+
         # Stack into matrix
         # If batched, Sxx are (Batch,). We want (Batch, 4, 4).
         # If scalar, Sxx are scalar. We want (4, 4).
-        
-        # Row 0
-        r0 = torch.stack([zero, zero, S31, S41], dim=-1)
-        r1 = torch.stack([zero, zero, S32, S42], dim=-1)
-        r2 = torch.stack([S31, S32, zero, zero], dim=-1)
-        r3 = torch.stack([S41, S42, zero, zero], dim=-1)
-        
+        #
+        # Port convention: {0,1} = left ports, {2,3} = right ports.
+        #
+        # Horizontal MZI (standard): light flows left→right, no back-reflection.
+        #   S₁₁ = S₂₂ = 0
+        #
+        # Vertical MZI (rotated 90°): port permutation swaps local ports 1↔2,
+        #   creating non-zero S₁₁ and S₂₂ (back-reflection between adjacent
+        #   waveguides on the same side of the mesh).
+        #   Physical routing:
+        #     LU→LL (S₁₁[1,0]=S31, back-reflection) and LU→RL (S₂₁[1,0]=S41)
+        #     LL→LU (S₁₁[0,1]=S31, back-reflection) and LL→RU (S₂₁[0,1]=S32)
+
+        if self.orientation == "horizontal":
+            r0 = torch.stack([zero, zero, S31, S41], dim=-1)
+            r1 = torch.stack([zero, zero, S32, S42], dim=-1)
+            r2 = torch.stack([S31, S32, zero, zero], dim=-1)
+            r3 = torch.stack([S41, S42, zero, zero], dim=-1)
+        else:  # vertical
+            r0 = torch.stack([zero, S31, zero, S41], dim=-1)
+            r1 = torch.stack([S31, zero, S32, zero], dim=-1)
+            r2 = torch.stack([zero, S32, zero, S42], dim=-1)
+            r3 = torch.stack([S41, zero, S42, zero], dim=-1)
+
         # (Batch, 4, 4) or (4, 4)
         matrix = torch.stack([r0, r1, r2, r3], dim=-2)
 
