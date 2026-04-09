@@ -3,6 +3,7 @@ from typing import Optional
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from module.MZI_array.mzi import redheffer_star_product
 from module.MZI_array.mzi_column_array import MZIlayer_column
 from module.MZI_array.mzi_row_array import MZIlayer_row
 
@@ -22,8 +23,8 @@ class SingleChannelFilter(nn.Module):
     """
     
     def __init__(self, mzi_row_num=5, mzi_column_num=4, repeat_num=5, kernel_size=3,
-                 detection_mode='coherent'):
-        
+                 detection_mode='coherent', input_phase_noise_sigma=0.0):
+
         """
         Initialize single channel filter with configurable detection mode
 
@@ -33,6 +34,7 @@ class SingleChannelFilter(nn.Module):
             repeat_num (int): Number of MZI layer repetitions, default 5
             kernel_size (int): Size of the convolution kernel, default 3
             detection_mode (str): 'coherent' or 'power', default 'coherent'
+            input_phase_noise_sigma (float): Std of input phase noise in radians, default 0.0
         """
         super(SingleChannelFilter, self).__init__()
 
@@ -46,6 +48,7 @@ class SingleChannelFilter(nn.Module):
         self.repeat_num = repeat_num
         self.kernel_size = kernel_size
         self.detection_mode = detection_mode
+        self.input_phase_noise_sigma = input_phase_noise_sigma
         self.num_ports = mzi_row_num * 2  # 10 ports for compatibility
 
         # Create alternating row and column MZI layers with global indexing
@@ -82,6 +85,9 @@ class SingleChannelFilter(nn.Module):
         # Trainable diagonal weight matrix
         self.diagonal_matrix = nn.Parameter(torch.randn(self.num_ports))
 
+        # Trainable Bias (Applied in electrical domain, used as thresholding)
+        self.bias = nn.Parameter(torch.zeros(1))
+
         # Other parameters
         self.flag = 0
         self.timing_stats = {'allocation': 0, 'computation': 0, 'total': 0}
@@ -91,6 +97,38 @@ class SingleChannelFilter(nn.Module):
 
         # Pre-allocate combined transfer matrix (cached only in eval mode)
         self._combined_matrix = None
+        
+        # === HOOK MECHANISM ===
+        self.enable_hook = False
+        self.hook_data = {
+            'optical_input': None,
+            'optical_output': None,
+            'mzi_voltages': None
+        }
+
+        # === PHASE NOISE CONTROL ===
+        self._eval_phase_noise = False  # Whether to inject phase noise in eval mode
+
+    # === Hook Methods ===
+    def enable_hooks(self):
+        self.enable_hook = True
+
+    def disable_hooks(self):
+        self.enable_hook = False
+        self.hook_data = {'optical_input': None, 'optical_output': None, 'mzi_voltages': None}
+
+    # === Phase Noise Control ===
+    def set_input_phase_noise(self, sigma: float):
+        """Set input phase noise sigma (in radians)"""
+        self.input_phase_noise_sigma = sigma
+
+    def enable_eval_phase_noise(self):
+        """Enable phase noise injection even in eval mode (for testing)"""
+        self._eval_phase_noise = True
+
+    def disable_eval_phase_noise(self):
+        """Disable phase noise injection in eval mode"""
+        self._eval_phase_noise = False
 
     def _prepare_voltages(
         self,
@@ -131,19 +169,6 @@ class SingleChannelFilter(nn.Module):
         raise ValueError("voltages must be None, 1D or 2D tensor.")
 
     def _get_combined_matrix(self, device, voltages: Optional[torch.Tensor] = None):
-        
-        """
-        Get combined transfer matrix with training-safe caching
-
-        CRITICAL: Always rebuild in training mode to prevent gradient graph issues
-        In eval mode, cache the matrix for performance optimization
-
-        Args:
-            device: Target device for the matrix
-
-        Returns:
-            torch.Tensor: Combined transfer matrix of shape (matrix_size, matrix_size)
-        """
         if voltages is not None:
             return self._build_combined_transfer_matrix(device, voltages=voltages)
 
@@ -165,18 +190,6 @@ class SingleChannelFilter(nn.Module):
     def _build_combined_transfer_matrix(
         self, device, voltages: Optional[torch.Tensor] = None
     ):
-        """
-        Build combined transfer matrix by multiplying all MZI layer matrices
-
-        Follows the sequence: Row -> Column -> Row -> Column -> ... -> Row
-        Matrix multiplication is performed in reverse order for proper composition
-
-        Args:
-            device: Target device for the matrix
-
-        Returns:
-            torch.Tensor: Combined transfer matrix
-        """
         if voltages is not None:
             voltages = voltages.to(device=device)
             if voltages.numel() != self.total_mzis:
@@ -184,38 +197,34 @@ class SingleChannelFilter(nn.Module):
                     f"Expected {self.total_mzis} voltages, got {voltages.numel()}."
                 )
 
-        # Start with identity matrix
-        combined_matrix = torch.eye(self.matrix_size, dtype=torch.complex64, device=device)
+        N = self.num_ports  # single-side port count
 
-        # Multiply matrices in reverse order (right to left multiplication)
-        # This ensures proper composition: output = M_n * M_{n-1} * ... * M_1 * input
-        for layer in reversed(self.layers):
+        # Identity element for Redheffer star product:
+        # zero reflection, perfect transmission  [[0, I], [I, 0]]
+        combined = torch.zeros(
+            self.matrix_size, self.matrix_size,
+            dtype=torch.complex64, device=device,
+        )
+        combined[:N, N:] = torch.eye(N, dtype=torch.complex64, device=device)
+        combined[N:, :N] = torch.eye(N, dtype=torch.complex64, device=device)
+
+        for layer in self.layers:
             layer_voltage = None
             if voltages is not None and hasattr(layer, "mzi_indices"):
                 layer_voltage = voltages[layer.mzi_indices]
             layer_matrix = layer._build_transfer_matrix(
                 device, voltage_overrides=layer_voltage
             )
-            combined_matrix = torch.matmul(layer_matrix, combined_matrix)
+            combined = redheffer_star_product(combined, layer_matrix, N)
 
-        return combined_matrix
+        return combined
 
     def _coherent_forward(self, patches, combined_matrix, return_intermediate=False):
-        """
-        Coherent detection: Process all inputs together through MZI array
-
-        Complex amplitudes interfere coherently, preserving phase information.
-        This is the traditional optical computing approach.
-
-        Args:
-            patches (torch.Tensor): Input patches, shape (batch_size, num_patches, num_ports)
-            combined_matrix (torch.Tensor): Combined MZI transfer matrix
-            return_intermediate (bool): Whether to save intermediate values
-
-        Returns:
-            tuple: (output_patches, processed_patch) if return_intermediate else output_patches
-        """
         batch_size, num_patches, num_ports = patches.shape
+
+        # === Hook: Record Inputs ===
+        if self.enable_hook:
+            self.hook_data['optical_input'] = patches.detach().cpu().clone()
 
         # Batch processing - flatten batch and patch dimensions
         batch_total = batch_size * num_patches
@@ -233,6 +242,11 @@ class SingleChannelFilter(nn.Module):
         output_flat = new_states[:, self.num_ports:self.num_ports + num_ports]
         output_patches = output_flat.view(batch_size, num_patches, num_ports)
 
+        # === Hook: Record Outputs ===
+        if self.enable_hook:
+            # Save as power for consistency with measurement
+            self.hook_data['optical_output'] = (torch.abs(output_patches)**2).detach().cpu().clone()
+
         # Save processed first patch if needed
         processed_patch = None
         if return_intermediate:
@@ -241,23 +255,12 @@ class SingleChannelFilter(nn.Module):
         return output_patches, processed_patch
 
     def _power_forward(self, patches, combined_matrix, return_intermediate=False):
-        """
-        Power detection: Process each input port independently, sum output powers
-
-        Simulates multiple independent optical sources (e.g., frequency comb teeth,
-        incoherent sources) where outputs add in power domain, not amplitude.
-        No coherent interference between different input ports.
-
-        Args:
-            patches (torch.Tensor): Input patches, shape (batch_size, num_patches, num_ports)
-            combined_matrix (torch.Tensor): Combined MZI transfer matrix
-            return_intermediate (bool): Whether to save intermediate values
-
-        Returns:
-            tuple: (output_powers, processed_patch) if return_intermediate else output_powers
-        """
         batch_size, num_patches, num_ports = patches.shape
         device = patches.device
+
+        # === Hook: Record Inputs ===
+        if self.enable_hook:
+            self.hook_data['optical_input'] = patches.detach().cpu().clone()
 
         # Initialize power accumulator
         output_powers = torch.zeros(batch_size, num_patches, num_ports,
@@ -283,9 +286,12 @@ class SingleChannelFilter(nn.Module):
             port_outputs = port_outputs.view(batch_size, num_patches, num_ports)
 
             # Convert to power and accumulate
-            # CORE PRINCIPLE: Power-domain linear superposition (no coherent interference)
             port_power = torch.abs(port_outputs) ** 2
             output_powers += port_power
+
+        # === Hook: Record Outputs ===
+        if self.enable_hook:
+            self.hook_data['optical_output'] = output_powers.detach().cpu().clone()
 
         # Save processed first patch if needed
         processed_patch = None
@@ -295,20 +301,10 @@ class SingleChannelFilter(nn.Module):
         return output_powers, processed_patch
 
     def get_all_time(self):
-        """
-        Recursively collect timing statistics from all layers
-
-        Returns:
-            dict: Dictionary containing accumulated timing statistics
-        """
         total_stats = {'allocation': 0, 'computation': 0, 'total': 0}
-
-        # Add current layer timing stats
         for key in total_stats:
             if hasattr(self, 'timing_stats'):
                 total_stats[key] += self.timing_stats[key]
-
-        # Recursively add all sublayer timing stats
         if hasattr(self, 'layers'):
             for layer in self.layers:
                 if hasattr(layer, 'get_all_time'):
@@ -317,21 +313,14 @@ class SingleChannelFilter(nn.Module):
                     layer_stats = layer.timing_stats
                 else:
                     continue
-
                 for key in total_stats:
                     total_stats[key] += layer_stats[key]
-
         return total_stats
 
     def train(self, mode=True):
-        """
-        Override train() to clear cache when switching to training mode
-
-        This prevents gradient graph issues from cached matrices
-        """
         super().train(mode)
-        if mode:  # Entering training mode
-            self._combined_matrix = None  # Clear cached matrix
+        if mode:
+            self._combined_matrix = None
         return self
 
     def forward(
@@ -340,24 +329,16 @@ class SingleChannelFilter(nn.Module):
         voltages: Optional[torch.Tensor] = None,
         return_intermediate=False,
     ):
-        """
-        Forward propagation function using combined transfer matrix
+        # === Hook: Record Voltages ===
+        if self.enable_hook:
+            # Collect voltages from all MZI layers
+            v_list = []
+            for layer in self.layers:
+                if hasattr(layer, 'MZI'):
+                    for mzi in layer.MZI:
+                        v_list.append(mzi.get_voltage().item())
+            self.hook_data['mzi_voltages'] = torch.tensor(v_list)
 
-        The forward process depends on the detection_mode:
-        - coherent: All inputs processed together, complex amplitude summation
-        - power: Each input port processed independently, power summation
-
-        Args:
-            x (Tensor): Input tensor of shape (batch_size, height, width)
-            voltages (Tensor or sequence, optional): Heater voltages provided as a
-                1D tensor (shared across the batch) or 2D tensor with shape
-                (batch_size, total_mzis).
-            return_intermediate (bool): Whether to return intermediate values for the first patch
-
-        Returns:
-            Tensor or tuple: Output tensor, or tuple of (output, input_patch, processed_patch)
-                           if return_intermediate=True
-        """
         # Get input dimensions
         batch_size, height, width = x.shape
 
@@ -366,16 +347,11 @@ class SingleChannelFilter(nn.Module):
         output_width = width - self.kernel_size + 1
 
         # Extract image patches
-        # Add channel dimension and unfold into patches
         patches = F.unfold(x.unsqueeze(1),
                           kernel_size=self.kernel_size,
-                          stride=1)  # Shape: (batch_size, kernel_size^2, num_patches)
-
-        # Adjust dimension order
-        patches = patches.permute(0, 2, 1)  # Shape: (batch_size, num_patches, kernel_size^2)
-
-        # Pad to match MZI port count (9 -> 10)
-        patches = F.pad(patches, (0, 1))  # Shape: (batch_size, num_patches, 10)
+                          stride=1) 
+        patches = patches.permute(0, 2, 1) 
+        patches = F.pad(patches, (0, 1)) 
 
         # Save first patch input if needed
         input_patch = None
@@ -384,6 +360,15 @@ class SingleChannelFilter(nn.Module):
 
         # Convert to complex type for MZI processing
         patches = patches.to(torch.complex64)
+
+        # Inject input phase noise (simulates fiber-induced phase fluctuations)
+        # Active during training, or in eval mode if explicitly enabled
+        should_inject_noise = self.input_phase_noise_sigma > 0 and (
+            self.training or self._eval_phase_noise
+        )
+        if should_inject_noise:
+            phase_noise = torch.randn(patches.shape, device=patches.device) * self.input_phase_noise_sigma
+            patches = patches * torch.exp(1j * phase_noise)
 
         # Resolve per-batch voltages
         voltage_batch = self._prepare_voltages(voltages, batch_size, patches.device)
@@ -441,9 +426,17 @@ class SingleChannelFilter(nn.Module):
             weighted_output = output_powers * (self.diagonal_matrix.abs() ** 2).view(1, 1, -1)
 
         # Sum across all output ports and reshape to spatial dimensions
-        output = weighted_output.sum(dim=2).view(batch_size, output_height, output_width)
+        if self.detection_mode == 'coherent':
+            # For coherent mode, output_patches contains complex amplitudes.
+            # We take the intensity (abs squared) before summing.
+            output = (torch.abs(weighted_output)**2).sum(dim=2).view(batch_size, output_height, output_width)
+        else:
+            # For power mode, weighted_output already contains power values.
+            output = weighted_output.sum(dim=2).view(batch_size, output_height, output_width)
 
-        # Return based on parameters
+        # Add Bias and apply ReLU (Thresholding logic)
+        output = F.relu(output + self.bias)
+
         if return_intermediate:
             return output, input_patch, processed_patch
         else:
