@@ -9,6 +9,7 @@ from module.channel import SingleChannelFilter
 from module.MZI_array.mzi_row_array import MZIlayer_row
 from module.MZI_array.mzi_column_array import MZIlayer_column
 from module.chaotic_source import chaotic_source
+from module.calibration_loader import load_mzi_calibration
 from train import train, test
 from torch.cuda.amp import GradScaler
 from args import get_args
@@ -19,73 +20,8 @@ import json
 
 
 def load_mzi_parameters_from_json(model, json_path):
-    """
-    Load hardware MZI parameters from JSON file and apply them to the model
-
-    Args:
-        model: OpticalNetwork model instance
-        json_path: Path to the mzi_parameters.json file
-    """
-    print(f"\n[Loading MZI Parameters from {json_path}]")
-
-    # Load JSON data
-    if not os.path.exists(json_path):
-        print(f"Warning: MZI parameters file not found at {json_path}")
-        print("Continuing with randomly initialized MZI parameters...")
-        return
-
-    with open(json_path, 'r') as f:
-        mzi_params = json.load(f)
-
-    total_mzis_loaded = 0
-    total_mzis_in_model = 0
-
-    # Helper function to load MZI parameters
-    def load_mzi_layer_params(mzi_layer):
-        nonlocal total_mzis_loaded, total_mzis_in_model
-        if hasattr(mzi_layer, 'MZI'):
-            for mzi in mzi_layer.MZI:
-                total_mzis_in_model += 1
-                if hasattr(mzi, 'index') and mzi.index is not None:
-                    param_key = str(mzi.index)
-                    if param_key in mzi_params:
-                        params = mzi_params[param_key]
-                        mzi.load_physical_parameters(
-                            a=params['a'],
-                            b=params['b'],
-                            delta_r=params['delta_r'],
-                            phi0=params['phi0']
-                        )
-                        mzi.freeze_fabrication_parameters()
-                        total_mzis_loaded += 1
-                    else:
-                        print(f"Warning: No parameters found for MZI index {mzi.index}")
-
-    # Traverse CNN layers
-    for layer in model.layers:
-        if isinstance(layer, CNN_layer):
-            for single_filter in layer.filters:
-                if isinstance(single_filter, SingleChannelFilter):
-                    for mzi_layer in single_filter.layers:
-                        load_mzi_layer_params(mzi_layer)
-
-    # Traverse Optical FC layer (if exists)
-    if hasattr(model, 'fc') and hasattr(model.fc, 'encoder_slices'):
-        print(f"\n[Loading MZI Parameters for Optical FC Layer]")
-        # Load encoder slice processors
-        for slice_processor in model.fc.encoder_slices:
-            if hasattr(slice_processor, 'filter') and hasattr(slice_processor.filter, 'layers'):
-                for mzi_layer in slice_processor.filter.layers:
-                    load_mzi_layer_params(mzi_layer)
-        # Load decoder slice processor
-        if hasattr(model.fc.decoder_slice, 'filter') and hasattr(model.fc.decoder_slice.filter, 'layers'):
-            for mzi_layer in model.fc.decoder_slice.filter.layers:
-                load_mzi_layer_params(mzi_layer)
-
-    print(f"\nSuccessfully loaded parameters for {total_mzis_loaded}/{total_mzis_in_model} MZIs")
-    print(f"Hardware parameters (FROZEN): a, b, delta_r, phi0")
-    print(f"Trainable parameters: voltage (initialized randomly)")
-    print(f"The model will now train voltages to implement weights on calibrated hardware.\n")
+    """Thin wrapper kept for backward compatibility."""
+    load_mzi_calibration(model, json_path)
 
 
 def collect_and_save_filter_data(model, dataloader, device, save_dir="filter_data"):
@@ -334,7 +270,7 @@ def main():
     ).to(device)
 
     # Load hardware MZI parameters from calibration results
-    load_mzi_parameters_from_json(model, 'results/mzi_parameters.json')
+    load_mzi_calibration(model, 'results/mzi_parameters_multi.json')
 
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
     scaler = GradScaler()

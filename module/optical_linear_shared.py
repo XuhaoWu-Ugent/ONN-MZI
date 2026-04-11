@@ -25,7 +25,10 @@ class OpticalSliceProcessor(nn.Module):
 
         # Pre-create MZI layers in __init__ (Clements architecture)
         self.layers = nn.ModuleList()
-        next_index = start_index
+        # Per-channel local indices (start at 0) so the same crosstalk matrix
+        # built from physical-MZI indices 0..49 can be sliced uniformly across
+        # every processor instance.
+        next_index = 0
 
         for rep in range(repeat_num):
             self.layers.append(MZIlayer_row(num=mzi_row_num, start_index=next_index))
@@ -36,7 +39,7 @@ class OpticalSliceProcessor(nn.Module):
         self.layers.append(MZIlayer_row(num=mzi_row_num, start_index=next_index))
         next_index += mzi_row_num
 
-        self.total_mzis = next_index - start_index
+        self.total_mzis = next_index
         self.num_ports = mzi_row_num * 2
         self.matrix_size = 2 * self.num_ports
         self._combined_matrix = None
@@ -45,7 +48,72 @@ class OpticalSliceProcessor(nn.Module):
         }
         self.enable_hook = False
 
+        # === THERMAL CROSSTALK ===
+        # crosstalk_matrix[dst, src] = (C_dst_src - R_dst_src), units rad / V^2.
+        # extra_phase[dst] = sum_src crosstalk_matrix[dst, src] * V_src^2,
+        # added to the self-heating delta_phi inside batch_mzi_transfer_matrices.
+        # Initialised to zero (no crosstalk); populated by
+        # `module.calibration_loader.load_mzi_calibration` when the
+        # multi-MZI fit JSON contains a `_crosstalk` block.
+        self.register_buffer(
+            "crosstalk_matrix",
+            torch.zeros(self.total_mzis, self.total_mzis, dtype=torch.float32),
+            persistent=False,
+        )
+        self._has_crosstalk = False
+
+    # === Thermal Crosstalk ===
+    def set_crosstalk_matrix(self, K: torch.Tensor) -> None:
+        """
+        Install a thermal crosstalk coupling matrix for this processor.
+
+        Args:
+            K: (total_mzis, total_mzis) tensor where
+               `K[dst, src]` is the heater-to-heater coupling
+               coefficient (rad / V^2) such that
+                   extra_phase[dst] = sum_src K[dst, src] * V_src^2.
+        """
+        if K.shape != (self.total_mzis, self.total_mzis):
+            raise ValueError(
+                f"Expected crosstalk matrix shape "
+                f"({self.total_mzis}, {self.total_mzis}), got {tuple(K.shape)}."
+            )
+        with torch.no_grad():
+            self.crosstalk_matrix.copy_(
+                K.to(
+                    dtype=self.crosstalk_matrix.dtype,
+                    device=self.crosstalk_matrix.device,
+                )
+            )
+        self._has_crosstalk = bool(torch.any(self.crosstalk_matrix != 0).item())
+        self._combined_matrix = None  # invalidate cache built without crosstalk
+
+    def disable_crosstalk(self) -> None:
+        with torch.no_grad():
+            self.crosstalk_matrix.zero_()
+        self._has_crosstalk = False
+        self._combined_matrix = None
+
+    def _gather_voltages(self, device: torch.device) -> torch.Tensor:
+        """
+        Collect every MZI's _voltage parameter in this processor as a
+        single (total_mzis,) tensor in the same order as `layer.mzi_indices`.
+        """
+        v_list = []
+        for layer in self.layers:
+            if hasattr(layer, "MZI"):
+                for mzi in layer.MZI:
+                    v_list.append(mzi._voltage)
+        return torch.cat(v_list).to(device=device)
+
     def _get_combined_matrix(self, device):
+        # When crosstalk is active the combined matrix depends on every
+        # per-MZI voltage (via the K @ V^2 term), so the eval-mode cache
+        # would have to refresh on every voltage change. Simpler and
+        # safer: rebuild every call when crosstalk is on.
+        if self._has_crosstalk:
+            return self._build_combined_matrix(device)
+
         should_update = (self._combined_matrix is None or
                         self._combined_matrix.device != device)
         if should_update:
@@ -60,6 +128,16 @@ class OpticalSliceProcessor(nn.Module):
     def _build_combined_matrix(self, device):
         N = self.num_ports  # single-side port count
 
+        # === Compute thermal-crosstalk extra phases for the whole channel ===
+        # extra_phases_all[dst] = sum_src crosstalk_matrix[dst, src] * V_src^2,
+        # then sliced per-layer via layer.mzi_indices below.
+        if self._has_crosstalk:
+            v_all = self._gather_voltages(device)
+            C = self.crosstalk_matrix.to(device=device, dtype=v_all.dtype)
+            extra_phases_all = C @ (v_all ** 2)
+        else:
+            extra_phases_all = None
+
         # Redheffer identity: zero reflection, perfect transmission
         combined = torch.zeros(
             self.matrix_size, self.matrix_size,
@@ -69,7 +147,12 @@ class OpticalSliceProcessor(nn.Module):
         combined[N:, :N] = torch.eye(N, dtype=torch.complex64, device=device)
 
         for layer in self.layers:
-            layer_matrix = layer._build_transfer_matrix(device)
+            layer_extra = None
+            if extra_phases_all is not None and hasattr(layer, "mzi_indices"):
+                layer_extra = extra_phases_all[layer.mzi_indices]
+            layer_matrix = layer._build_transfer_matrix(
+                device, extra_phases=layer_extra
+            )
             combined = redheffer_star_product(combined, layer_matrix, N)
         return combined
 
@@ -193,6 +276,24 @@ class OpticalLoRALinear(nn.Module):
         # Trainable Bias (Initialized randomly to break symmetry)
         self.bias = nn.Parameter(torch.randn(r) * 0.1)
 
+        # === DC offset cancellation (running mean subtraction) ===
+        # Under multi-MZI calibration with frozen fabrication parameters
+        # the differential dual-path output develops a per-channel DC
+        # offset (random batch-mean mismatch between the two independently
+        # initialised pos/neg meshes + the trainable fc.bias) that
+        # dominates the much smaller input-dependent signal at init time
+        # and locks every sample to the same argmax class. We remove this
+        # DC offset with a per-channel running mean subtraction in the
+        # electronic domain — the digital analogue of an AC-coupling /
+        # DC-blocking primitive standard in differential photonic
+        # detection front-ends. See HARDWARE_AWARE_FC_DESIGN_NOTES.md.
+        self.register_buffer(
+            "running_logit_mean",
+            torch.zeros(out_features),
+            persistent=True,
+        )
+        self.bn_momentum = 0.1
+
         # Hook data for FC input (needed for hardware extraction)
         self._fc_input_hook = None
         self._enable_fc_input_hook = False
@@ -236,6 +337,22 @@ class OpticalLoRALinear(nn.Module):
 
         if self.output_proj is not None:
             output = self.output_proj(output)
+
+        # === DC offset cancellation ===
+        # Subtract the running per-channel batch mean. Training: use the
+        # current batch mean and update the running EMA. Inference: use
+        # the frozen running EMA. This zeros out the input-independent
+        # DC offset on the differential output without touching the
+        # input-dependent component.
+        if self.training:
+            batch_mean = output.mean(dim=0)
+            output = output - batch_mean.unsqueeze(0)
+            with torch.no_grad():
+                self.running_logit_mean.mul_(1.0 - self.bn_momentum).add_(
+                    self.bn_momentum * batch_mean.detach()
+                )
+        else:
+            output = output - self.running_logit_mean.unsqueeze(0)
 
         return output
 

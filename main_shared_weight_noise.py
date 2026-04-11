@@ -13,6 +13,7 @@ from module.channel import SingleChannelFilter
 from module.MZI_array.mzi_row_array import MZIlayer_row
 from module.MZI_array.mzi_column_array import MZIlayer_column
 from module.chaotic_source import chaotic_source
+from module.calibration_loader import load_mzi_calibration
 from train import test  # Keep test, but we will redefine train
 from torch.cuda.amp import GradScaler
 from torch.amp import autocast
@@ -26,36 +27,8 @@ import json
 from torch.amp import autocast
 
 def load_mzi_parameters_from_json(model, json_path):
-    if not os.path.exists(json_path): return
-    with open(json_path, 'r') as f: mzi_params = json.load(f)
-    
-    def load_mzi_layer_params(mzi_layer):
-        if hasattr(mzi_layer, 'MZI'):
-            for mzi in mzi_layer.MZI:
-                if hasattr(mzi, 'index') and mzi.index is not None:
-                    physical_index = mzi.index % 50
-                    param_key = str(physical_index)
-                    if param_key in mzi_params:
-                        params = mzi_params[param_key]
-                        mzi.load_physical_parameters(
-                            a=params['a'], b=params['b'],
-                            delta_r=params['delta_r'], phi0=params['phi0']
-                        )
-                        mzi.freeze_fabrication_parameters()
-
-    for layer in model.layers:
-        if isinstance(layer, CNN_layer):
-            for f in layer.filters:
-                for ml in f.layers: load_mzi_layer_params(ml)
-
-    if hasattr(model, 'fc'):
-        for path in ['pos_encoder_slices', 'neg_encoder_slices']:
-            if hasattr(model.fc, path):
-                for p in getattr(model.fc, path):
-                    for ml in p.layers: load_mzi_layer_params(ml)
-        for path in ['pos_decoder_slice', 'neg_decoder_slice']:
-            if hasattr(model.fc, path):
-                for ml in getattr(model.fc, path).layers: load_mzi_layer_params(ml)
+    """Thin wrapper kept for backward compatibility."""
+    load_mzi_calibration(model, json_path)
 
 # === New Training Function with Weight Noise Injection ===
 def train_with_weight_noise(model, device, train_loader, optimizer, epoch, scaler, args,
@@ -331,7 +304,7 @@ def main():
         fc_pos_only=args.fc_pos_only
     ).to(device)
 
-    load_mzi_parameters_from_json(model, 'results/mzi_parameters.json')
+    load_mzi_calibration(model, 'results/mzi_parameters_multi.json')
 
     # Wrap model with DDP for distributed training
     if is_distributed:

@@ -39,7 +39,6 @@ class MZIlayer_column(nn.Module):
         self.MZI = nn.ModuleList(
             [MZI(index=self.mzi_indices[i], **mzi_kwargs) for i in range(num)]
         )
-        self.mzis = self.MZI
         self.flag = 0
         self.timing_stats = {"allocation": 0.0, "computation": 0.0, "total": 0.0}
 
@@ -49,6 +48,12 @@ class MZIlayer_column(nn.Module):
 
         # Pre-compute scatter indices for vectorized matrix assembly.
         self._precompute_scatter_indices()
+
+    @property
+    def mzis(self):
+        """Backward-compatible alias for self.MZI (read-only property to
+        avoid nn.Module double-registration in state_dict)."""
+        return self.MZI
 
     # ------------------------------------------------------------------
     # Cache helpers
@@ -175,6 +180,7 @@ class MZIlayer_column(nn.Module):
         self,
         device: torch.device,
         voltage_overrides: Optional[torch.Tensor] = None,
+        extra_phases: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """
         Build the 2N×2N scattering matrix for the entire column.
@@ -186,6 +192,7 @@ class MZIlayer_column(nn.Module):
         Args:
             device: Target device for the matrix.
             voltage_overrides: Optional tensor of shape (num,) or (Batch, num).
+            extra_phases: Optional (num,) extra phase from thermal crosstalk.
 
         Returns:
             (matrix_size, matrix_size) or (Batch, matrix_size, matrix_size).
@@ -193,6 +200,7 @@ class MZIlayer_column(nn.Module):
         use_cache = (
             not self.training
             and voltage_overrides is None
+            and extra_phases is None
             and self._cached_matrix is not None
             and self._cached_signature == self._parameter_signature()
         )
@@ -204,6 +212,8 @@ class MZIlayer_column(nn.Module):
         raw_b = torch.cat([m._raw_b for m in self.MZI]).to(device)
         raw_dr = torch.cat([m._raw_delta_r for m in self.MZI]).to(device)
         raw_p0 = torch.cat([m._raw_phi0 for m in self.MZI]).to(device)
+        raw_ppi = torch.cat([m._raw_p_pi for m in self.MZI]).to(device)
+        raw_alpha = torch.cat([m._raw_alpha for m in self.MZI]).to(device)
 
         is_batched = False
         if voltage_overrides is not None:
@@ -226,13 +236,14 @@ class MZIlayer_column(nn.Module):
 
         # --- Vectorized S-matrix computation ---
         mzi0 = self.MZI[0]
+        nom_r = torch.tensor([m.nominal_resistance for m in self.MZI],
+                             dtype=raw_a.dtype, device=device)
         s_all = batch_mzi_transfer_matrices(
-            raw_a, raw_b, raw_dr, raw_p0, v,
-            nominal_resistance=mzi0.nominal_resistance,
-            p_pi=mzi0.p_pi,
-            alpha_amplitude=mzi0.alpha_amplitude,
+            raw_a, raw_b, raw_dr, raw_p0, raw_ppi, raw_alpha, v,
+            nominal_resistance=nom_r,
             epsilon=mzi0.epsilon,
             orientation=mzi0.orientation,
+            extra_phases=extra_phases,
         )  # (K, 4, 4) or (B, K, 4, 4)
 
         # --- Scatter into array matrix ---

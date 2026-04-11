@@ -18,23 +18,26 @@ def batch_mzi_transfer_matrices(
     raw_b: torch.Tensor,
     raw_delta_r: torch.Tensor,
     raw_phi0: torch.Tensor,
+    raw_p_pi: torch.Tensor,
+    raw_alpha: torch.Tensor,
     voltage: torch.Tensor,
     nominal_resistance: float,
-    p_pi: float,
-    alpha_amplitude: torch.Tensor,
     epsilon: float = 1e-8,
     orientation: str = "horizontal",
+    extra_phases: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Compute 4x4 scattering matrices for K MZIs in one vectorized pass.
 
     Args:
         raw_a, raw_b, raw_delta_r, raw_phi0: (K,) raw parameter tensors.
+        raw_p_pi: (K,) raw P_pi parameter tensor.
+        raw_alpha: (K,) raw insertion loss parameter tensor.
         voltage: (K,) shared or (B, K) per-sample voltage tensor.
-        nominal_resistance, p_pi: scalar physical constants.
-        alpha_amplitude: scalar tensor (insertion-loss amplitude).
+        nominal_resistance: scalar physical constant (Ohm).
         epsilon: numerical guard.
         orientation: 'horizontal' or 'vertical'.
+        extra_phases: optional (K,) extra phase from thermal crosstalk.
 
     Returns:
         (K, 4, 4) complex tensor if voltage is 1-D,
@@ -42,21 +45,28 @@ def batch_mzi_transfer_matrices(
     """
     guard = epsilon
     # --- bounded parameter mappings (all shape (K,)) ---
-    a = 0.45 + 0.1 * torch.clamp(torch.sigmoid(raw_a), guard, 1.0 - guard)
-    b = 0.45 + 0.1 * torch.clamp(torch.sigmoid(raw_b), guard, 1.0 - guard)
-    delta_r = 50.0 * torch.tanh(raw_delta_r)
+    a = 0.3 + 0.4 * torch.clamp(torch.sigmoid(raw_a), guard, 1.0 - guard)
+    b = 0.3 + 0.4 * torch.clamp(torch.sigmoid(raw_b), guard, 1.0 - guard)
+    delta_r = 200.0 * torch.tanh(raw_delta_r)
     phi0 = math.pi * torch.tanh(raw_phi0)
+    p_pi = 5e-3 + 70e-3 * torch.sigmoid(raw_p_pi)  # [5mW, 75mW]
+    alpha_amp = 0.3 + 0.7 * torch.sigmoid(raw_alpha)  # [0.3, 1.0]
 
     dtype = a.dtype
     device = a.device
 
-    resistance = torch.clamp(
-        torch.tensor(nominal_resistance, dtype=dtype, device=device) + delta_r,
-        min=1.0,
-    )  # (K,)
+    if torch.is_tensor(nominal_resistance):
+        nom_r = nominal_resistance.to(dtype=dtype, device=device)
+    else:
+        nom_r = torch.tensor(nominal_resistance, dtype=dtype, device=device)
+    resistance = torch.clamp(nom_r + delta_r, min=1.0)  # (K,)
 
     # delta_phi: (K,) or (B, K) depending on voltage shape
     delta_phi = math.pi * (voltage ** 2) / (resistance * p_pi)
+
+    # Add thermal crosstalk extra phase if provided
+    if extra_phases is not None:
+        delta_phi = delta_phi + extra_phases
 
     phi1 = 0.5 * phi0 + delta_phi     # (K,) or (B, K)
     phi2 = -0.5 * phi0                 # (K,)
@@ -69,9 +79,10 @@ def batch_mzi_transfer_matrices(
     exp_phi1 = _exp_neg_j(phi1)   # (K,) or (B, K)
     exp_phi2 = _exp_neg_j(phi2)   # (K,)
 
+    # Per-MZI alpha as complex (K,)
     alpha_c = torch.complex(
-        alpha_amplitude.to(dtype=dtype, device=device),
-        torch.zeros(1, dtype=dtype, device=device),
+        alpha_amp,
+        torch.zeros_like(alpha_amp),
     )
     j_c = torch.complex(
         torch.zeros(1, dtype=dtype, device=device),
@@ -190,15 +201,11 @@ class MZI(nn.Module):
         self.index = index
         self.orientation = orientation
         self.nominal_resistance = float(nominal_resistance)
-        self.p_pi = float(p_pi)
         self.epsilon = float(epsilon)
         # 训练阶段可通过 lossless 参数或环境变量关闭插入损耗
         self.lossless = bool(lossless) or bool(int(os.getenv("MZI_LOSSLESS", "0")))
 
-        alpha_value = 1.0 if self.lossless else math.sqrt(0.94)
-        self.register_buffer(
-            "alpha_amplitude", torch.tensor(alpha_value, dtype=torch.float32)
-        )
+        self.lossless = bool(lossless) or bool(int(os.getenv("MZI_LOSSLESS", "0")))
         self.device = torch.device("cuda") if torch.cuda.is_available() else "cpu"
 
         # Hardware fabrication parameters (should be loaded from calibration and frozen)
@@ -207,6 +214,26 @@ class MZI(nn.Module):
         self._raw_b = nn.Parameter(torch.zeros(1), requires_grad=trainable_fabrication)
         self._raw_delta_r = nn.Parameter(torch.zeros(1), requires_grad=trainable_fabrication)
         self._raw_phi0 = nn.Parameter(torch.zeros(1), requires_grad=trainable_fabrication)
+
+        # Trainable P_pi: bounded to [5mW, 30mW] via sigmoid mapping
+        init_p_pi = float(p_pi)
+        init_sigmoid = (init_p_pi - 5e-3) / 25e-3
+        init_sigmoid = max(1e-6, min(1 - 1e-6, init_sigmoid))
+        init_raw = math.log(init_sigmoid / (1 - init_sigmoid))
+        self._raw_p_pi = nn.Parameter(
+            torch.tensor([init_raw]), requires_grad=trainable_fabrication
+        )
+
+        # Trainable per-MZI insertion loss alpha: bounded to [0.5, 1.0]
+        # alpha = 0.5 + 0.5 * sigmoid(raw)
+        # Default: sqrt(0.94) ≈ 0.9695 if lossy, 1.0 if lossless
+        alpha_default = 1.0 if self.lossless else math.sqrt(0.94)
+        init_alpha_sig = (alpha_default - 0.5) / 0.5
+        init_alpha_sig = max(1e-6, min(1 - 1e-6, init_alpha_sig))
+        init_alpha_raw = math.log(init_alpha_sig / (1 - init_alpha_sig))
+        self._raw_alpha = nn.Parameter(
+            torch.tensor([init_alpha_raw]), requires_grad=trainable_fabrication
+        )
 
         # Voltage parameter (trainable - this is what we control to implement CNN weights)
         # Initialize with small random values to break symmetry
@@ -231,16 +258,23 @@ class MZI(nn.Module):
     # ------------------------------------------------------------------
     def _bounded_split_ratio(self, raw: torch.Tensor) -> torch.Tensor:
         guard = self.epsilon
-        # Map sigmoid output [0,1] to [0.45, 0.55]
+        # Map sigmoid output [0,1] to [0.3, 0.7]
         sigmoid_out = torch.sigmoid(raw)
-        # Scale to range 0.1 and shift to start at 0.45
-        return 0.45 + 0.1 * torch.clamp(sigmoid_out, guard, 1.0 - guard)
+        return 0.3 + 0.4 * torch.clamp(sigmoid_out, guard, 1.0 - guard)
 
     def _bounded_delta_r(self, raw: torch.Tensor) -> torch.Tensor:
-        return 50.0 * torch.tanh(raw)
+        return 200.0 * torch.tanh(raw)
 
     def _bounded_phi0(self, raw: torch.Tensor) -> torch.Tensor:
         return math.pi * torch.tanh(raw)
+
+    def _bounded_p_pi(self, raw: torch.Tensor) -> torch.Tensor:
+        """Map raw parameter to P_pi in [5e-3, 75e-3] W (5-75 mW)."""
+        return 5e-3 + 70e-3 * torch.sigmoid(raw)
+
+    def _bounded_alpha(self, raw: torch.Tensor) -> torch.Tensor:
+        """Map raw parameter to insertion loss alpha in [0.3, 1.0]."""
+        return 0.3 + 0.7 * torch.sigmoid(raw)
 
     # ------------------------------------------------------------------
     # Public helpers
@@ -257,11 +291,16 @@ class MZI(nn.Module):
         delta_r = self._bounded_delta_r(self._raw_delta_r)
         phi0 = self._bounded_phi0(self._raw_phi0)
 
+        p_pi = self._bounded_p_pi(self._raw_p_pi)
+        alpha = self._bounded_alpha(self._raw_alpha)
+
         return {
             "a": a,
             "b": b,
             "delta_r": delta_r,
             "phi0": phi0,
+            "p_pi": p_pi,
+            "alpha": alpha,
         }
 
     def load_physical_parameters(
@@ -271,11 +310,12 @@ class MZI(nn.Module):
         b: Optional[Union[float, torch.Tensor]] = None,
         delta_r: Optional[Union[float, torch.Tensor]] = None,
         phi0: Optional[Union[float, torch.Tensor]] = None,
+        p_pi: Optional[Union[float, torch.Tensor]] = None,
+        alpha: Optional[Union[float, torch.Tensor]] = None,
     ) -> None:
         """
         Overwrite the internal fabrication parameters with calibrated physical values.
 
-        The provided values must respect the valid ranges described in AGENTS.md.
         After loading, you should call freeze_fabrication_parameters() to prevent
         these from being trained.
         """
@@ -286,26 +326,37 @@ class MZI(nn.Module):
         with torch.no_grad():
             if a is not None:
                 a_tensor = torch.as_tensor(a, dtype=dtype, device=device)
-                a_tensor = torch.clamp(a_tensor, 0.45, 0.55)
-                # Inverse of sigmoid mapping: raw = logit((a - 0.45) / 0.1)
-                normalized = (a_tensor - 0.45) / 0.1
+                a_tensor = torch.clamp(a_tensor, 0.3, 0.7)
+                normalized = (a_tensor - 0.3) / 0.4
                 self._raw_a.copy_(torch.logit(normalized))
 
             if b is not None:
                 b_tensor = torch.as_tensor(b, dtype=dtype, device=device)
-                b_tensor = torch.clamp(b_tensor, 0.45, 0.55)
-                normalized = (b_tensor - 0.45) / 0.1
+                b_tensor = torch.clamp(b_tensor, 0.3, 0.7)
+                normalized = (b_tensor - 0.3) / 0.4
                 self._raw_b.copy_(torch.logit(normalized))
 
             if delta_r is not None:
                 delta_tensor = torch.as_tensor(delta_r, dtype=dtype, device=device)
-                ratio = torch.clamp(delta_tensor / 50.0, -1.0 + eps, 1.0 - eps)
+                ratio = torch.clamp(delta_tensor / 200.0, -1.0 + eps, 1.0 - eps)
                 self._raw_delta_r.copy_(torch.atanh(ratio))
 
             if phi0 is not None:
                 phi_tensor = torch.as_tensor(phi0, dtype=dtype, device=device)
                 ratio = torch.clamp(phi_tensor / math.pi, -1.0 + eps, 1.0 - eps)
                 self._raw_phi0.copy_(torch.atanh(ratio))
+
+            if p_pi is not None:
+                p_pi_tensor = torch.as_tensor(p_pi, dtype=dtype, device=device)
+                p_pi_tensor = torch.clamp(p_pi_tensor, 5e-3 + 1e-6, 75e-3 - 1e-6)
+                normalized = (p_pi_tensor - 5e-3) / 70e-3
+                self._raw_p_pi.copy_(torch.logit(normalized))
+
+            if alpha is not None:
+                alpha_tensor = torch.as_tensor(alpha, dtype=dtype, device=device)
+                alpha_tensor = torch.clamp(alpha_tensor, 0.3 + 1e-6, 1.0 - 1e-6)
+                normalized = (alpha_tensor - 0.3) / 0.7
+                self._raw_alpha.copy_(torch.logit(normalized))
 
     def freeze_fabrication_parameters(self) -> None:
         """
@@ -316,6 +367,8 @@ class MZI(nn.Module):
         self._raw_b.requires_grad = False
         self._raw_delta_r.requires_grad = False
         self._raw_phi0.requires_grad = False
+        self._raw_p_pi.requires_grad = False
+        self._raw_alpha.requires_grad = False
 
     def unfreeze_fabrication_parameters(self) -> None:
         """
@@ -325,6 +378,8 @@ class MZI(nn.Module):
         self._raw_b.requires_grad = True
         self._raw_delta_r.requires_grad = True
         self._raw_phi0.requires_grad = True
+        self._raw_p_pi.requires_grad = True
+        self._raw_alpha.requires_grad = True
 
     def get_voltage(self) -> torch.Tensor:
         """
@@ -388,8 +443,9 @@ class MZI(nn.Module):
             torch.tensor(self.nominal_resistance, dtype=dtype, device=device) + delta_r,
             min=1.0,
         )
+        p_pi = self._bounded_p_pi(self._raw_p_pi).to(device=device, dtype=dtype)
         # delta_phi shape: (Batch,) or (1,)
-        delta_phi = math.pi * (voltage_tensor**2) / (resistance * self.p_pi)
+        delta_phi = math.pi * (voltage_tensor ** 2) / (resistance * p_pi)
 
         phi1 = 0.5 * phi0 + delta_phi
         phi2 = -0.5 * phi0
@@ -406,7 +462,7 @@ class MZI(nn.Module):
         exp_phi1 = _exp_neg_j(phi1) # (Batch,)
         exp_phi2 = _exp_neg_j(phi2) # Scalar
 
-        alpha_real = self.alpha_amplitude.to(device=device, dtype=dtype)
+        alpha_real = self._bounded_alpha(self._raw_alpha).to(device=device, dtype=dtype)
         alpha = torch.complex(alpha_real, torch.zeros_like(alpha_real))
         j_const = torch.complex(
             torch.zeros_like(alpha_real), torch.ones_like(alpha_real)
@@ -483,6 +539,8 @@ class MZI(nn.Module):
                 self._raw_b,
                 self._raw_delta_r,
                 self._raw_phi0,
+                self._raw_p_pi,
+                self._raw_alpha,
                 self._voltage,
             )
         )

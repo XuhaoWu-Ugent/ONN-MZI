@@ -97,7 +97,21 @@ class SingleChannelFilter(nn.Module):
 
         # Pre-allocate combined transfer matrix (cached only in eval mode)
         self._combined_matrix = None
-        
+
+        # === THERMAL CROSSTALK ===
+        # crosstalk_matrix[dst, src] = (C_dst_src - R_dst_src), units rad / V^2.
+        # extra_phase[dst] = sum_src crosstalk_matrix[dst, src] * V_src^2,
+        # added to the self-heating delta_phi inside batch_mzi_transfer_matrices.
+        # Initialised to zero (no crosstalk); populated by
+        # `module.calibration_loader.load_mzi_calibration` when the
+        # multi-MZI fit JSON contains a `_crosstalk` block.
+        self.register_buffer(
+            "crosstalk_matrix",
+            torch.zeros(self.total_mzis, self.total_mzis, dtype=torch.float32),
+            persistent=False,
+        )
+        self._has_crosstalk = False
+
         # === HOOK MECHANISM ===
         self.enable_hook = False
         self.hook_data = {
@@ -116,6 +130,41 @@ class SingleChannelFilter(nn.Module):
     def disable_hooks(self):
         self.enable_hook = False
         self.hook_data = {'optical_input': None, 'optical_output': None, 'mzi_voltages': None}
+
+    # === Thermal Crosstalk ===
+    def set_crosstalk_matrix(self, K: torch.Tensor) -> None:
+        """
+        Install a thermal crosstalk coupling matrix for this channel.
+
+        Args:
+            K: (total_mzis, total_mzis) tensor where
+               `K[dst, src]` is the heater-to-heater coupling
+               coefficient (rad / V^2) such that
+                   extra_phase[dst] = sum_src K[dst, src] * V_src^2.
+        """
+        if K.shape != (self.total_mzis, self.total_mzis):
+            raise ValueError(
+                f"Expected crosstalk matrix shape "
+                f"({self.total_mzis}, {self.total_mzis}), got {tuple(K.shape)}."
+            )
+        with torch.no_grad():
+            self.crosstalk_matrix.copy_(
+                K.to(
+                    dtype=self.crosstalk_matrix.dtype,
+                    device=self.crosstalk_matrix.device,
+                )
+            )
+        self._has_crosstalk = bool(torch.any(self.crosstalk_matrix != 0).item())
+        # Crosstalk couples the entire filter's voltage vector into every
+        # layer's transfer matrix, so any cached matrix built before the
+        # install is now stale.
+        self._combined_matrix = None
+
+    def disable_crosstalk(self) -> None:
+        with torch.no_grad():
+            self.crosstalk_matrix.zero_()
+        self._has_crosstalk = False
+        self._combined_matrix = None
 
     # === Phase Noise Control ===
     def set_input_phase_noise(self, sigma: float):
@@ -172,11 +221,14 @@ class SingleChannelFilter(nn.Module):
         if voltages is not None:
             return self._build_combined_transfer_matrix(device, voltages=voltages)
 
-        # TRAINING MODE: Always rebuild matrix to avoid gradient conflicts
-        if self.training:
+        # TRAINING MODE: Always rebuild matrix to avoid gradient conflicts.
+        # CROSSTALK MODE: Always rebuild because the combined matrix depends
+        # on every per-MZI voltage in this channel via the K @ V^2 term, and
+        # the cache key would have to include all of them.
+        if self.training or self._has_crosstalk:
             return self._build_combined_transfer_matrix(device)
 
-        # EVAL MODE: Use caching for performance
+        # EVAL MODE (no crosstalk): Use caching for performance
         should_update = (self._combined_matrix is None or
                         self._combined_matrix.device != device)
 
@@ -187,6 +239,33 @@ class SingleChannelFilter(nn.Module):
 
         return self._combined_matrix
 
+    def _gather_channel_voltages(
+        self,
+        device: torch.device,
+        voltages: Optional[torch.Tensor],
+    ) -> Optional[torch.Tensor]:
+        """
+        Collect every MZI voltage in this channel into a single (total_mzis,)
+        tensor. Returns None when crosstalk is inactive (caller can skip
+        the matmul).
+
+        When `voltages` is supplied (external override), it is used directly.
+        Otherwise the per-MZI trainable `_voltage` parameters are gathered
+        in the same order as `layer.mzi_indices` (i.e. global index 0 first).
+        """
+        if not self._has_crosstalk:
+            return None
+
+        if voltages is not None:
+            return voltages.to(device=device)
+
+        v_list = []
+        for layer in self.layers:
+            if hasattr(layer, "MZI"):
+                for mzi in layer.MZI:
+                    v_list.append(mzi._voltage)
+        return torch.cat(v_list).to(device=device)
+
     def _build_combined_transfer_matrix(
         self, device, voltages: Optional[torch.Tensor] = None
     ):
@@ -196,6 +275,16 @@ class SingleChannelFilter(nn.Module):
                 raise ValueError(
                     f"Expected {self.total_mzis} voltages, got {voltages.numel()}."
                 )
+
+        # === Compute thermal-crosstalk extra phases for the whole channel ===
+        # extra_phases_all[dst] = sum_src crosstalk_matrix[dst, src] * V_src^2,
+        # then sliced per-layer via layer.mzi_indices below.
+        v_all = self._gather_channel_voltages(device, voltages)
+        if v_all is not None:
+            C = self.crosstalk_matrix.to(device=device, dtype=v_all.dtype)
+            extra_phases_all = C @ (v_all ** 2)
+        else:
+            extra_phases_all = None
 
         N = self.num_ports  # single-side port count
 
@@ -210,10 +299,15 @@ class SingleChannelFilter(nn.Module):
 
         for layer in self.layers:
             layer_voltage = None
+            layer_extra = None
             if voltages is not None and hasattr(layer, "mzi_indices"):
                 layer_voltage = voltages[layer.mzi_indices]
+            if extra_phases_all is not None and hasattr(layer, "mzi_indices"):
+                layer_extra = extra_phases_all[layer.mzi_indices]
             layer_matrix = layer._build_transfer_matrix(
-                device, voltage_overrides=layer_voltage
+                device,
+                voltage_overrides=layer_voltage,
+                extra_phases=layer_extra,
             )
             combined = redheffer_star_product(combined, layer_matrix, N)
 

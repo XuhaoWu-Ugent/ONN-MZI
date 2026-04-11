@@ -10,6 +10,7 @@ from torchvision import datasets, transforms, models
 import wandb
 from module.ONN_shared import OpticalNetwork
 from module.CNN import CNN_layer
+from module.calibration_loader import load_mzi_calibration
 from torch.cuda.amp import GradScaler
 from torch.amp import autocast
 from args import get_args
@@ -17,6 +18,56 @@ import random
 import numpy as np
 import os
 import json
+
+# Hardware electrical constraint: |V| on every MZI heater must stay
+# below this value (volts). The chip cannot be driven beyond ~5V due
+# to thermal-power limits, so trained voltages are clamped after every
+# optimiser step to keep them deployable to the physical heaters.
+VOLTAGE_CLAMP_V = float(os.environ.get("VOLTAGE_CLAMP_V", "5.0"))
+
+# Per-processor thermal power budget (mW). Each voltage configuration
+# loaded onto the 50-MZI chip must not exceed this total heater power,
+# so the on-chip thermal equilibrium matches the conditions under which
+# mzi_parameters_multi.json was calibrated (17-37 mW typical, <=50 mW
+# acceptable). Set to 0 to disable the constraint.
+POWER_BUDGET_MW = float(os.environ.get("POWER_BUDGET_MW", "50.0"))
+
+
+def _constrain_power_per_processor(model, budget_mw):
+    """Project voltages so each processor's total heater power <= budget.
+
+    After the per-MZI voltage clamp, this function checks every
+    SingleChannelFilter / OpticalSliceProcessor in the model. If the
+    sum P = Σ V_i² / R_meas_i exceeds `budget_mw`, all voltages in
+    that processor are scaled by sqrt(budget/P), preserving the
+    relative voltage pattern while bringing total power within budget.
+    """
+    if budget_mw <= 0:
+        return
+    from module.channel import SingleChannelFilter
+    from module.optical_linear_shared import OpticalSliceProcessor
+
+    with torch.no_grad():
+        for module in model.modules():
+            if not isinstance(module, (SingleChannelFilter, OpticalSliceProcessor)):
+                continue
+            v_list = []
+            r_list = []
+            for layer in module.layers:
+                if hasattr(layer, "MZI"):
+                    for mzi in layer.MZI:
+                        v_list.append(mzi._voltage)
+                        r_list.append(mzi.nominal_resistance)
+            if not v_list:
+                continue
+            p_total_mw = sum(
+                (v.item() ** 2) / r * 1000.0 for v, r in zip(v_list, r_list)
+            )
+            if p_total_mw > budget_mw:
+                scale = (budget_mw / p_total_mw) ** 0.5
+                for v in v_list:
+                    v.data.mul_(scale)
+
 
 # === 1. ResNet18 Teacher Wrapper (Modified for MNIST) ===
 class ResNet18MNIST(nn.Module):
@@ -183,8 +234,8 @@ def train_distill(student, teacher, device, train_loader, optimizer, epoch, scal
     criterion_feat = torch.nn.MSELoss() 
     
     TEMP = 4.0
-    ALPHA = float(os.environ.get('DISTILL_ALPHA', 0.5))
-    BETA = float(os.environ.get('DISTILL_BETA', 1.0))
+    KD_ALPHA = float(os.environ.get('DISTILL_ALPHA', 0.5))
+    KD_BETA = float(os.environ.get('DISTILL_BETA', 1.0))
     
     # === Weight Noise Config ===
     sigma_weight = args.weight_noise_sigma
@@ -233,7 +284,7 @@ def train_distill(student, teacher, device, train_loader, optimizer, epoch, scal
             loss_kd = distillation_loss(student_logits, teacher_logits, temperature=TEMP)
             loss_feat = criterion_feat(student_feat_adapted, teacher_feat)
             
-            loss = (1.0 - ALPHA) * loss_ce + ALPHA * loss_kd + BETA * loss_feat
+            loss = (1.0 - KD_ALPHA) * loss_ce + KD_ALPHA * loss_kd + KD_BETA * loss_feat
             
         scaler.scale(loss).backward()
         
@@ -249,6 +300,23 @@ def train_distill(student, teacher, device, train_loader, optimizer, epoch, scal
         scaler.step(optimizer)
         scaler.update()
         if scheduler: scheduler.step()
+
+        # === Hardware constraint: clamp |V| <= 5V ===
+        # The chip's heaters cannot be driven beyond ~5V (thermal limit).
+        # Apply the clamp after every optimiser step so the trained
+        # voltages can be deployed directly without saturation clipping.
+        with torch.no_grad():
+            for name, param in student.named_parameters():
+                if param.requires_grad and "_voltage" in name:
+                    param.data.clamp_(-VOLTAGE_CLAMP_V, VOLTAGE_CLAMP_V)
+
+        # === Thermal power constraint ===
+        # Each 50-MZI processor must not exceed POWER_BUDGET_MW total
+        # heater power, so the chip operates within the thermal envelope
+        # of the multi-MZI calibration.
+        if POWER_BUDGET_MW > 0:
+            student_model = student.module if hasattr(student, "module") else student
+            _constrain_power_per_processor(student_model, POWER_BUDGET_MW)
 
         epoch_loss += loss.item() * len(data)
         pred = student_logits.argmax(dim=1, keepdim=True)
@@ -328,31 +396,8 @@ def test_ensemble(model, device, test_loader, args, rank=0, num_repeats=5):
     return test_loss, accuracy
 
 def load_mzi_parameters_from_json(model, json_path):
-    if not os.path.exists(json_path): return
-    with open(json_path, 'r') as f: mzi_params = json.load(f)
-    def load_mzi_layer_params(mzi_layer):
-        if hasattr(mzi_layer, 'MZI'):
-            for mzi in mzi_layer.MZI:
-                if hasattr(mzi, 'index') and mzi.index is not None:
-                    physical_index = mzi.index % 50
-                    param_key = str(physical_index)
-                    if param_key in mzi_params:
-                        params = mzi_params[param_key]
-                        mzi.load_physical_parameters(a=params['a'], b=params['b'], delta_r=params['delta_r'], phi0=params['phi0'])
-                        mzi.freeze_fabrication_parameters()
-    for layer in model.layers:
-        if isinstance(layer, CNN_layer):
-            for f in layer.filters:
-                for ml in f.layers: load_mzi_layer_params(ml)
-    if hasattr(model, 'fc'):
-        for path in ['pos_encoder_slices', 'neg_encoder_slices', 'pos_decoder_slice', 'neg_decoder_slice']:
-            if hasattr(model.fc, path):
-                module = getattr(model.fc, path)
-                if isinstance(module, nn.ModuleList):
-                    for p in module: 
-                        for ml in p.layers: load_mzi_layer_params(ml)
-                elif hasattr(module, 'layers'):
-                    for ml in module.layers: load_mzi_layer_params(ml)
+    """Thin wrapper kept for backward compatibility."""
+    load_mzi_calibration(model, json_path)
 
 def main():
     args = get_args()
@@ -415,7 +460,7 @@ def main():
         input_phase_noise_sigma=args.input_phase_noise_sigma
     ).to(device)
     
-    load_mzi_parameters_from_json(student, 'results/mzi_parameters.json')
+    load_mzi_calibration(student, 'results/mzi_parameters_multi.json')
 
     # === 3. Feature Adapter ===
     feature_adapter = nn.Linear(student.feature_size, 512).to(device)
@@ -424,18 +469,61 @@ def main():
         student = DDP(student, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
         feature_adapter = DDP(feature_adapter, device_ids=[local_rank], output_device=local_rank)
 
+    # === Param groups: voltage gets a higher LR ===
+    # Under the multi-MZI fit's working point (R*P_pi ~= 78.5) the voltage
+    # parameter's loss-landscape gradient is intrinsically ~5-12x smaller
+    # than under the old single-MZI default; we compensate by giving
+    # `_voltage` its own param group at a higher LR. Other parameters
+    # (diagonal_matrix, bias, output_proj, feature_adapter) stay at args.lr.
+    voltage_params, other_params = [], []
+    for n, p in student.named_parameters():
+        if not p.requires_grad:
+            continue
+        if "_voltage" in n:
+            voltage_params.append(p)
+        else:
+            other_params.append(p)
+    other_params += [p for p in feature_adapter.parameters() if p.requires_grad]
+
+    voltage_lr_mult = float(os.environ.get("VOLTAGE_LR_MULT", "5.0"))
+    other_lr = args.lr
+    voltage_lr = args.lr * voltage_lr_mult
+
+    # Voltage is a physical control signal, not a statistical weight;
+    # it has no L2-prior interpretation. Applying Adam's weight decay
+    # to voltages was observed to pull every MZI towards V≈0 (87% of
+    # voltages ended up in |V|<0.5 after epoch 1), which collapses the
+    # photonic cascade into a near-identity transform and reduces the
+    # whole network to an electronic classifier — the opposite of the
+    # hardware-aware training we want. We therefore disable weight
+    # decay on the voltage group while keeping it on the electronic
+    # parameters.
     optimizer = torch.optim.Adam(
-        list(student.parameters()) + list(feature_adapter.parameters()), 
-        lr=args.lr, weight_decay=1e-5
+        [
+            {"params": other_params,   "lr": other_lr,   "weight_decay": 1e-5},
+            {"params": voltage_params, "lr": voltage_lr, "weight_decay": 0.0},
+        ],
     )
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer, max_lr=args.lr, steps_per_epoch=len(train_loader), 
-        epochs=args.epochs, pct_start=0.2
+        optimizer,
+        max_lr=[other_lr, voltage_lr],
+        steps_per_epoch=len(train_loader),
+        epochs=args.epochs, pct_start=0.2,
     )
+
+    if rank == 0:
+        print(f"[Optimizer] voltage params: {sum(p.numel() for p in voltage_params)} "
+              f"(lr={voltage_lr:.4f}); other params: "
+              f"{sum(p.numel() for p in other_params)} (lr={other_lr:.4f})")
+
+    if rank == 0:
+        print(f"[Optimizer] hardware voltage clamp: |V| <= {VOLTAGE_CLAMP_V} V")
+        if POWER_BUDGET_MW > 0:
+            print(f"[Optimizer] per-processor power budget: {POWER_BUDGET_MW:.1f} mW")
     scaler = GradScaler()
     best_test_accuracy = 0.0
     
-    BETA = float(os.environ.get('DISTILL_BETA', 1.0))
+    KD_BETA = float(os.environ.get('DISTILL_BETA', 1.0))
 
     if rank == 0:
         print(f"\n[Distillation] Starting Training. Teacher: ResNet18, Student: ONN (K={args.num_shared_weights})")

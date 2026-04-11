@@ -6,35 +6,13 @@ import os
 import json
 from module.ONN_shared import OpticalNetwork
 from module.CNN import CNN_layer
+from module.calibration_loader import load_mzi_calibration
 from args import get_args
 from torchvision import datasets, transforms
 
 def load_mzi_parameters_from_json(model, json_path):
-    if not os.path.exists(json_path): return
-    with open(json_path, 'r') as f: mzi_params = json.load(f)
-    def load_mzi_layer_params(mzi_layer):
-        if hasattr(mzi_layer, 'MZI'):
-            for mzi in mzi_layer.MZI:
-                if hasattr(mzi, 'index') and mzi.index is not None:
-                    physical_index = mzi.index % 50
-                    param_key = str(physical_index)
-                    if param_key in mzi_params:
-                        params = mzi_params[param_key]
-                        mzi.load_physical_parameters(a=params['a'], b=params['b'], delta_r=params['delta_r'], phi0=params['phi0'])
-                        mzi.freeze_fabrication_parameters()
-    for layer in model.layers:
-        if isinstance(layer, CNN_layer):
-            for f in layer.filters:
-                for ml in f.layers: load_mzi_layer_params(ml)
-    if hasattr(model, 'fc'):
-        for path in ['pos_encoder_slices', 'neg_encoder_slices', 'pos_decoder_slice', 'neg_decoder_slice']:
-            if hasattr(model.fc, path):
-                module = getattr(model.fc, path)
-                if isinstance(module, nn.ModuleList):
-                    for p in module:
-                        for ml in p.layers: load_mzi_layer_params(ml)
-                elif hasattr(module, 'layers'):
-                    for ml in module.layers: load_mzi_layer_params(ml)
+    """Thin wrapper kept for backward compatibility."""
+    load_mzi_calibration(model, json_path)
 
 
 def compute_mzi_output_power(filter_module, input_amplitude, device):
@@ -120,7 +98,7 @@ def collect_hardware_data():
     
     print(f"Loading weights from {checkpoint_path}...")
     model.load_state_dict(torch.load(checkpoint_path, map_location=device))
-    load_mzi_parameters_from_json(model, 'results/mzi_parameters.json')
+    load_mzi_calibration(model, 'results/mzi_parameters_multi.json')
     model.eval()
 
     # 3. Enable Hooks
