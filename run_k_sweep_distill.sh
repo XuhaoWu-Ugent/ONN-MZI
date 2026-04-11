@@ -36,7 +36,7 @@ export POWER_BUDGET_MW=50.0    # per-processor thermal power limit (mW)
 K_LIST="5 10 15 20 30 45 58"
 HIDDEN_CHANNELS=4
 EPOCHS=15
-LR=0.01
+LR=0.01          # base lr for electronic params; voltage lr = LR * VOLTAGE_LR_MULT = 0.1
 BATCH_SIZE=200
 
 # === Distillation settings ===

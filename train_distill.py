@@ -508,7 +508,8 @@ def main():
         optimizer,
         max_lr=[other_lr, voltage_lr],
         steps_per_epoch=len(train_loader),
-        epochs=args.epochs, pct_start=0.2,
+        epochs=args.epochs,
+        pct_start=float(os.environ.get("ONECYCLE_PCT_START", "0.1")),
     )
 
     if rank == 0:
