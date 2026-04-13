@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -155,15 +156,29 @@ class OpticalNetwork(nn.Module):
         return total_stats
 
     def forward(self, x, return_features=False):
+        # When feeding an Optical FC in power mode, the CNN output P (≥0
+        # after the filter's ReLU) is sent through sqrt → ELU → square
+        # before the FC. ELU is identity on non-negative inputs and
+        # sqrt·square cancel, so the chain is a mathematical no-op on P
+        # — but sqrt's derivative blows up near 0, polluting Adam's 2nd
+        # moment. We bypass the round-trip and feed P directly to the FC.
+        # Gated by env var so old behavior remains the default.
+        bypass_amp_roundtrip = (
+            os.environ.get('OPTICAL_FC_POWER_BYPASS', '0') == '1'
+            and self.use_optical_fc
+            and self.detection_mode == 'power'
+        )
+
         for layer_idx, (layer, bn) in enumerate(zip(self.layers, self.bns)):
             if self.flag == 1:
                 layer.flag = 1
             x = layer(x)
-            if self.detection_mode == 'coherent':
-                x = torch.abs(x)
-            else:
-                x = torch.sqrt(x + 1e-8)
-            x = self.activation(x)
+            if not bypass_amp_roundtrip:
+                if self.detection_mode == 'coherent':
+                    x = torch.abs(x)
+                else:
+                    x = torch.sqrt(x + 1e-8)
+                x = self.activation(x)
             if hasattr(self, 'save_feature_maps') and self.save_feature_maps:
                 batch_idx = 0
                 num_channels = x.shape[1]
@@ -183,7 +198,8 @@ class OpticalNetwork(nn.Module):
         x = self.flatten(x)
 
         if self.use_optical_fc:
-            x = x ** 2
+            if not bypass_amp_roundtrip:
+                x = x ** 2
             x = self.fc(x)
             # No sqrt here, using raw logits
         else:
