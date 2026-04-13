@@ -18,7 +18,7 @@ nvidia-smi
 
 # ==========================================
 # Scout run: CNN uses 10x10 MZI mesh, FC uses electronic nn.Linear
-#   - Isolates FC layer choice vs OpticalLoRALinear
+#   - Isolates FC layer choice vs OpticalSharedLinear
 #   - Same alpha=0, beta=0 (pure CE) for comparability with
 #     run_test_alpha0_beta0.sh
 #   - Same final_div_factor=10 (experiment B)

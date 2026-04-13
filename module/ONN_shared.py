@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from module.CNN import CNN_layer
-from module.optical_linear_shared import OpticalLoRALinear # Modified import
+from module.optical_linear_shared import OpticalSharedLinear
 
 
 class OpticalNetwork(nn.Module):
@@ -83,7 +83,7 @@ class OpticalNetwork(nn.Module):
             fc_start_index = self._calculate_total_mzis()
 
             use_clean_fc = os.environ.get('OPTICAL_FC_CLEAN', '0') == '1'
-            self.fc = OpticalLoRALinear(
+            self.fc = OpticalSharedLinear(
                 in_features=self.feature_size,
                 out_features=output_size,
                 r=10,  # Hardware constraint

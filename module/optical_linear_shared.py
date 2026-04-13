@@ -1,9 +1,13 @@
 """
-Optical LoRA Linear Layer (Shared Weights Version)
+Optical Shared Linear Layer
 
-Based on the Dual-Path Differential Architecture, but supports Weight Sharing.
-Key feature: Allows 'num_shared_weights' (K) < 'n_slices' (N).
-The N slices reuse the K MZI arrays in a cyclic manner.
+Dual-Path Differential architecture with K-way weight sharing across
+N input slices. The N slices reuse K physical MZI processors in a
+cyclic manner (slice i uses processor i % K).
+
+Previously named `OpticalLoRALinear`; renamed because the architecture
+is not related to LoRA (no frozen base weight + low-rank correction).
+A backward-compat alias `OpticalLoRALinear` is kept at module bottom.
 """
 
 import torch
@@ -186,9 +190,9 @@ class OpticalSliceProcessor(nn.Module):
         return output_powers
 
 
-class OpticalLoRALinear(nn.Module):
+class OpticalSharedLinear(nn.Module):
     """
-    Optical LoRA Linear Layer (Shared Weights & Dual-Path)
+    Optical Shared Linear Layer (Dual-Path + K-way weight sharing).
     """
 
     def __init__(self,
@@ -204,7 +208,7 @@ class OpticalLoRALinear(nn.Module):
                  num_shared_weights=None,  # New Parameter
                  pos_only: bool = False,   # Debug: only use positive path
                  use_clean_fc: bool = False):  # Drop decoder + replace bias/DC-cancel with diagonal affine
-        super(OpticalLoRALinear, self).__init__()
+        super(OpticalSharedLinear, self).__init__()
 
         # Validate parameters
         if r != 10: raise ValueError(f"Rank r must be 10, got {r}")
@@ -325,7 +329,7 @@ class OpticalLoRALinear(nn.Module):
     def _print_architecture(self):
         mode = "Clean (no decoder, diagonal affine)" if self.use_clean_fc else "Legacy (decoder + DC-cancel)"
         print(f"\n{'='*70}")
-        print(f"OpticalLoRALinear Initialized ({mode})")
+        print(f"OpticalSharedLinear Initialized ({mode})")
         print(f"{'='*70}")
         print(f"Input Features: {self.in_features}")
         print(f"Slices (N): {self.n_slices}")
@@ -508,3 +512,9 @@ class OpticalLoRALinear(nn.Module):
     
     def save_hook_data(self, filepath):
         pass
+
+
+# Backward-compat alias. External scripts (extract_*.py, etc.) that
+# still import by the old name continue to work. Prefer
+# `OpticalSharedLinear` in new code.
+OpticalLoRALinear = OpticalSharedLinear

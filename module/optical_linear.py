@@ -1,10 +1,14 @@
 """
-Optical LoRA Linear Layer (Refactored)
+Optical Linear Layer (non-shared, Dual-Path Differential)
 
 Refactored based on CNN.py design pattern:
 - Pre-create all slice processors in __init__ (similar to multiple filters in CNN_layer)
 - Each processor creates its own MZI array and manages its transfer matrix cache
 - Use batch matrix operations in forward, iterating only through processors
+
+Previously named `OpticalLoRALinear`; renamed because the architecture
+is not related to LoRA. A backward-compat alias `OpticalLoRALinear` is
+kept at module bottom.
 """
 
 import torch
@@ -178,9 +182,9 @@ class OpticalSliceProcessor(nn.Module):
         return output_powers
 
 
-class OpticalLoRALinear(nn.Module):
+class OpticalLinear(nn.Module):
     """
-    Optical LoRA Linear Layer (Dual-Path Differential Architecture)
+    Optical Linear Layer (Dual-Path Differential Architecture, non-shared)
 
     Implements true signed weights using differential detection:
     Y = (Y_pos - Y_neg) + Bias
@@ -204,7 +208,7 @@ class OpticalLoRALinear(nn.Module):
                  mzi_column_num=4,
                  repeat_num=5,
                  start_index=0):
-        super(OpticalLoRALinear, self).__init__()
+        super(OpticalLinear, self).__init__()
 
         # Validate parameters
         if r != 10:
@@ -294,7 +298,7 @@ class OpticalLoRALinear(nn.Module):
     def _print_architecture(self):
         """Print architecture summary."""
         print(f"\n{'='*70}")
-        print(f"OpticalLoRALinear Initialized (Dual-Path Differential)")
+        print(f"OpticalLinear Initialized (Dual-Path Differential)")
         print(f"{'='*70}")
         print(f"Input Features: {self.in_features}")
         print(f"Output Features: {self.out_features}")
@@ -519,3 +523,7 @@ class OpticalLoRALinear(nn.Module):
         hook_data = self.get_hook_data()
         torch.save(hook_data, filepath)
         print(f"Hook data saved to {filepath}")
+
+
+# Backward-compat alias. Prefer `OpticalLinear` in new code.
+OpticalLoRALinear = OpticalLinear

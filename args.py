@@ -63,7 +63,7 @@ def get_args():
     # Optical Fully Connected Layer
     fc_group = parser.add_argument_group('Optical Fully Connected Layer')
     fc_group.add_argument('--use-optical-fc', action='store_true', default=True,
-                          help='Use OpticalLoRALinear instead of nn.Linear for final layer')
+                          help='Use OpticalSharedLinear instead of nn.Linear for final layer')
     fc_group.add_argument('--no-optical-fc', dest='use_optical_fc', action='store_false',
                           help='Use electronic nn.Linear for final layer (for comparison)')
     fc_group.add_argument('--fc-activation-mode', type=str, default='linear',

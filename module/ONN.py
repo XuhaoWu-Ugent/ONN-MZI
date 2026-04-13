@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
 from module.CNN import CNN_layer
-from module.optical_linear import OpticalLoRALinear
+from module.optical_linear import OpticalLinear
 
 
 class OpticalNetwork(nn.Module):
@@ -42,7 +42,7 @@ class OpticalNetwork(nn.Module):
             input_size (int): Size of input images, default 14
             kernel_size (int): Size of convolution kernels, default 3
             detection_mode (str): 'coherent' or 'power', default 'coherent'
-            use_optical_fc (bool): Use OpticalLoRALinear instead of nn.Linear, default True
+            use_optical_fc (bool): Use OpticalLinear instead of nn.Linear, default True
             fc_activation_mode (str): 'linear' or 'nonlinear' for optical FC, default 'linear'
         """
         super(OpticalNetwork, self).__init__()
@@ -99,7 +99,7 @@ class OpticalNetwork(nn.Module):
             # Calculate MZI start index (after all CNN layers)
             fc_start_index = self._calculate_total_mzis()
 
-            self.fc = OpticalLoRALinear(
+            self.fc = OpticalLinear(
                 in_features=self.feature_size,
                 out_features=output_size,
                 r=10,  # Hardware constraint
@@ -256,7 +256,7 @@ class OpticalNetwork(nn.Module):
             # x is currently in amplitude scale after activation
             x = x ** 2  # amplitude -> power domain
 
-            x = self.fc(x)  # OpticalLoRALinear (operates in power domain)
+            x = self.fc(x)  # OpticalLinear (operates in power domain)
 
             # Output includes electrical bias and can be negative (Logits).
             # Do NOT take sqrt here.

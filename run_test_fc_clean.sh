@@ -17,7 +17,7 @@ conda activate onn
 nvidia-smi
 
 # ==========================================
-# Stage-1 cleanup of OpticalLoRALinear:
+# Stage-1 cleanup of OpticalSharedLinear:
 #   P1: drop decoder (save 100 MZI, no expressive loss in power mode)
 #   P3: replace dead bias + running_mean DC cancel with diagonal affine
 #       (trainable scale + shift per output class, 20 electronic params)
