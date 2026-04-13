@@ -191,7 +191,7 @@ class OpticalLoRALinear(nn.Module):
     Optical LoRA Linear Layer (Shared Weights & Dual-Path)
     """
 
-    def __init__(self, 
+    def __init__(self,
                  in_features,
                  out_features,
                  r=10,
@@ -202,27 +202,29 @@ class OpticalLoRALinear(nn.Module):
                  repeat_num=5,
                  start_index=0,
                  num_shared_weights=None,  # New Parameter
-                 pos_only: bool = False):  # Debug: only use positive path
+                 pos_only: bool = False,   # Debug: only use positive path
+                 use_clean_fc: bool = False):  # Drop decoder + replace bias/DC-cancel with diagonal affine
         super(OpticalLoRALinear, self).__init__()
 
         # Validate parameters
         if r != 10: raise ValueError(f"Rank r must be 10, got {r}")
-        
+
         self.in_features = in_features
         self.out_features = out_features
         self.r = r
-        self.activation_mode = activation_mode
+        self.activation_mode = activation_mode  # Unused (kept for backward compat)
         self.detection_mode = detection_mode
         self.num_shared_weights = num_shared_weights # Store K
         self.pos_only = pos_only  # If True, skip negative path (debug/diagnosis)
+        self.use_clean_fc = use_clean_fc
 
         self.n_slices = math.ceil(in_features / r)
         self.padded_in = self.n_slices * r
-        
+
         # Determine how many PHYSICAL processors to create
         # If shared: K. If not shared: n_slices.
         self.num_processors = self.n_slices if num_shared_weights is None else num_shared_weights
-        
+
         if self.num_processors > self.n_slices:
              self.num_processors = self.n_slices # Cap at N
 
@@ -238,13 +240,19 @@ class OpticalLoRALinear(nn.Module):
             self.pos_encoder_slices.append(processor)
             next_index += processor.total_mzis
         self.pos_encoder_mzis = next_index - start_index
-        
-        # Decoder (Always 1)
-        self.pos_decoder_slice = OpticalSliceProcessor(
-            mzi_row_num=mzi_row_num, mzi_column_num=mzi_column_num,
-            repeat_num=repeat_num, start_index=next_index
-        )
-        next_index += self.pos_decoder_slice.total_mzis
+
+        # Decoder (Legacy only — clean mode skips it: in power mode the
+        # composition of two non-negative linear maps is still rank-10
+        # non-negative, so the decoder provides no expressive gain and
+        # costs 50 MZIs per path.)
+        if not use_clean_fc:
+            self.pos_decoder_slice = OpticalSliceProcessor(
+                mzi_row_num=mzi_row_num, mzi_column_num=mzi_column_num,
+                repeat_num=repeat_num, start_index=next_index
+            )
+            next_index += self.pos_decoder_slice.total_mzis
+        else:
+            self.pos_decoder_slice = None
 
         # === NEGATIVE PATH ===
         # Encoder
@@ -259,12 +267,15 @@ class OpticalLoRALinear(nn.Module):
             next_index += processor.total_mzis
         self.neg_encoder_mzis = next_index - neg_encoder_start
 
-        # Decoder
-        self.neg_decoder_slice = OpticalSliceProcessor(
-            mzi_row_num=mzi_row_num, mzi_column_num=mzi_column_num,
-            repeat_num=repeat_num, start_index=next_index
-        )
-        next_index += self.neg_decoder_slice.total_mzis
+        # Decoder (Legacy only)
+        if not use_clean_fc:
+            self.neg_decoder_slice = OpticalSliceProcessor(
+                mzi_row_num=mzi_row_num, mzi_column_num=mzi_column_num,
+                repeat_num=repeat_num, start_index=next_index
+            )
+            next_index += self.neg_decoder_slice.total_mzis
+        else:
+            self.neg_decoder_slice = None
 
         self.total_mzis = next_index - start_index
 
@@ -273,26 +284,37 @@ class OpticalLoRALinear(nn.Module):
         else:
             self.output_proj = None
 
-        # Trainable Bias (Initialized randomly to break symmetry)
-        self.bias = nn.Parameter(torch.randn(r) * 0.1)
-
-        # === DC offset cancellation (running mean subtraction) ===
-        # Under multi-MZI calibration with frozen fabrication parameters
-        # the differential dual-path output develops a per-channel DC
-        # offset (random batch-mean mismatch between the two independently
-        # initialised pos/neg meshes + the trainable fc.bias) that
-        # dominates the much smaller input-dependent signal at init time
-        # and locks every sample to the same argmax class. We remove this
-        # DC offset with a per-channel running mean subtraction in the
-        # electronic domain — the digital analogue of an AC-coupling /
-        # DC-blocking primitive standard in differential photonic
-        # detection front-ends. See HARDWARE_AWARE_FC_DESIGN_NOTES.md.
-        self.register_buffer(
-            "running_logit_mean",
-            torch.zeros(out_features),
-            persistent=True,
-        )
-        self.bn_momentum = 0.1
+        if use_clean_fc:
+            # Clean mode: diagonal affine on (pos − neg), applied in
+            # r-space (before output_proj) to match the legacy bias
+            # placement. Replaces the dead bias + running_logit_mean
+            # hack with proper trainable per-port scale + shift. No
+            # cross-port mixing, so the optical mesh remains the source
+            # of feature combination. 2r electronic params.
+            self.bias = None
+            self.output_scale = nn.Parameter(torch.ones(r))
+            self.output_shift = nn.Parameter(torch.zeros(r))
+        else:
+            # Legacy: bias + running mean subtraction (bias is effectively
+            # killed by the mean subtraction; kept for backward compat).
+            self.bias = nn.Parameter(torch.randn(r) * 0.1)
+            # === DC offset cancellation (running mean subtraction) ===
+            # Under multi-MZI calibration with frozen fabrication parameters
+            # the differential dual-path output develops a per-channel DC
+            # offset (random batch-mean mismatch between the two independently
+            # initialised pos/neg meshes + the trainable fc.bias) that
+            # dominates the much smaller input-dependent signal at init time
+            # and locks every sample to the same argmax class. We remove this
+            # DC offset with a per-channel running mean subtraction in the
+            # electronic domain — the digital analogue of an AC-coupling /
+            # DC-blocking primitive standard in differential photonic
+            # detection front-ends. See HARDWARE_AWARE_FC_DESIGN_NOTES.md.
+            self.register_buffer(
+                "running_logit_mean",
+                torch.zeros(out_features),
+                persistent=True,
+            )
+            self.bn_momentum = 0.1
 
         # Hook data for FC input (needed for hardware extraction)
         self._fc_input_hook = None
@@ -301,8 +323,9 @@ class OpticalLoRALinear(nn.Module):
         self._print_architecture()
 
     def _print_architecture(self):
+        mode = "Clean (no decoder, diagonal affine)" if self.use_clean_fc else "Legacy (decoder + DC-cancel)"
         print(f"\n{'='*70}")
-        print(f"OpticalLoRALinear Initialized (Shared Weights + Dual-Path)")
+        print(f"OpticalLoRALinear Initialized ({mode})")
         print(f"{'='*70}")
         print(f"Input Features: {self.in_features}")
         print(f"Slices (N): {self.n_slices}")
@@ -314,8 +337,10 @@ class OpticalLoRALinear(nn.Module):
         if self.training:
             for p in self.pos_encoder_slices: p.clear_cache()
             for p in self.neg_encoder_slices: p.clear_cache()
-            self.pos_decoder_slice.clear_cache()
-            self.neg_decoder_slice.clear_cache()
+            if self.pos_decoder_slice is not None:
+                self.pos_decoder_slice.clear_cache()
+            if self.neg_decoder_slice is not None:
+                self.neg_decoder_slice.clear_cache()
 
         # Record FC input for hardware extraction
         if self._enable_fc_input_hook:
@@ -323,36 +348,50 @@ class OpticalLoRALinear(nn.Module):
 
         # === POSITIVE PATH ===
         pos_hidden = self.forward_encoder(x, self.pos_encoder_slices)
-        pos_output = self.forward_decoder(pos_hidden, self.pos_decoder_slice)
+        if self.use_clean_fc:
+            pos_output = pos_hidden  # Skip decoder
+        else:
+            pos_output = self.forward_decoder(pos_hidden, self.pos_decoder_slice)
 
         if self.pos_only:
-            output = pos_output + self.bias
+            if self.use_clean_fc:
+                output = self.output_scale * pos_output + self.output_shift
+            else:
+                output = pos_output + self.bias
         else:
             # === NEGATIVE PATH ===
             neg_hidden = self.forward_encoder(x, self.neg_encoder_slices)
-            neg_output = self.forward_decoder(neg_hidden, self.neg_decoder_slice)
+            if self.use_clean_fc:
+                neg_output = neg_hidden  # Skip decoder
+            else:
+                neg_output = self.forward_decoder(neg_hidden, self.neg_decoder_slice)
 
             # === DIFFERENTIAL OUTPUT ===
-            output = (pos_output - neg_output) + self.bias
+            diff = pos_output - neg_output
+            if self.use_clean_fc:
+                output = self.output_scale * diff + self.output_shift
+            else:
+                output = diff + self.bias
 
         if self.output_proj is not None:
             output = self.output_proj(output)
 
-        # === DC offset cancellation ===
-        # Subtract the running per-channel batch mean. Training: use the
-        # current batch mean and update the running EMA. Inference: use
-        # the frozen running EMA. This zeros out the input-independent
-        # DC offset on the differential output without touching the
-        # input-dependent component.
-        if self.training:
-            batch_mean = output.mean(dim=0)
-            output = output - batch_mean.unsqueeze(0)
-            with torch.no_grad():
-                self.running_logit_mean.mul_(1.0 - self.bn_momentum).add_(
-                    self.bn_momentum * batch_mean.detach()
-                )
-        else:
-            output = output - self.running_logit_mean.unsqueeze(0)
+        if not self.use_clean_fc:
+            # === DC offset cancellation ===
+            # Subtract the running per-channel batch mean. Training: use the
+            # current batch mean and update the running EMA. Inference: use
+            # the frozen running EMA. This zeros out the input-independent
+            # DC offset on the differential output without touching the
+            # input-dependent component.
+            if self.training:
+                batch_mean = output.mean(dim=0)
+                output = output - batch_mean.unsqueeze(0)
+                with torch.no_grad():
+                    self.running_logit_mean.mul_(1.0 - self.bn_momentum).add_(
+                        self.bn_momentum * batch_mean.detach()
+                    )
+            else:
+                output = output - self.running_logit_mean.unsqueeze(0)
 
         return output
 
@@ -445,15 +484,19 @@ class OpticalLoRALinear(nn.Module):
         self._enable_fc_input_hook = True
         for p in self.pos_encoder_slices: p.enable_hook = True
         for p in self.neg_encoder_slices: p.enable_hook = True
-        self.pos_decoder_slice.enable_hook = True
-        self.neg_decoder_slice.enable_hook = True
+        if self.pos_decoder_slice is not None:
+            self.pos_decoder_slice.enable_hook = True
+        if self.neg_decoder_slice is not None:
+            self.neg_decoder_slice.enable_hook = True
 
     def disable_hooks(self):
         self._enable_fc_input_hook = False
         for p in self.pos_encoder_slices: p.enable_hook = False
         for p in self.neg_encoder_slices: p.enable_hook = False
-        self.pos_decoder_slice.enable_hook = False
-        self.neg_decoder_slice.enable_hook = False
+        if self.pos_decoder_slice is not None:
+            self.pos_decoder_slice.enable_hook = False
+        if self.neg_decoder_slice is not None:
+            self.neg_decoder_slice.enable_hook = False
 
     def get_fc_input(self):
         """Get the recorded FC input for hardware extraction."""

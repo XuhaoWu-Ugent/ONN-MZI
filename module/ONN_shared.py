@@ -82,6 +82,7 @@ class OpticalNetwork(nn.Module):
             # Calculate MZI start index (after all CNN layers)
             fc_start_index = self._calculate_total_mzis()
 
+            use_clean_fc = os.environ.get('OPTICAL_FC_CLEAN', '0') == '1'
             self.fc = OpticalLoRALinear(
                 in_features=self.feature_size,
                 out_features=output_size,
@@ -94,6 +95,7 @@ class OpticalNetwork(nn.Module):
                 start_index=fc_start_index,
                 num_shared_weights=self.num_shared_weights, # Pass shared weights param
                 pos_only=self.fc_pos_only,
+                use_clean_fc=use_clean_fc,
             )
         else:
             # Use electronic linear layer
