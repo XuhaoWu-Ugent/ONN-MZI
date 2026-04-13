@@ -504,18 +504,22 @@ def main():
             {"params": voltage_params, "lr": voltage_lr, "weight_decay": 0.0},
         ],
     )
+    onecycle_final_div = float(os.environ.get("ONECYCLE_FINAL_DIV_FACTOR", "1e4"))
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=[other_lr, voltage_lr],
         steps_per_epoch=len(train_loader),
         epochs=args.epochs,
         pct_start=float(os.environ.get("ONECYCLE_PCT_START", "0.1")),
+        final_div_factor=onecycle_final_div,
     )
 
     if rank == 0:
         print(f"[Optimizer] voltage params: {sum(p.numel() for p in voltage_params)} "
               f"(lr={voltage_lr:.4f}); other params: "
               f"{sum(p.numel() for p in other_params)} (lr={other_lr:.4f})")
+        print(f"[Optimizer] OneCycleLR final_div_factor={onecycle_final_div:g} "
+              f"(end voltage_lr≈{voltage_lr/(25*onecycle_final_div):.2e})")
 
     if rank == 0:
         print(f"[Optimizer] hardware voltage clamp: |V| <= {VOLTAGE_CLAMP_V} V")
