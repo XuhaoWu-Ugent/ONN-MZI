@@ -10,6 +10,7 @@ is not related to LoRA (no frozen base weight + low-rank correction).
 A backward-compat alias `OpticalLoRALinear` is kept at module bottom.
 """
 
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -298,7 +299,22 @@ class OpticalSharedLinear(nn.Module):
             self.bias = None
             self.output_scale = nn.Parameter(torch.ones(r))
             self.output_shift = nn.Parameter(torch.zeros(r))
+
+            # OPTIONAL: learnable per-slice aggregation weights.
+            # Replaces the fixed `Σ y_i / √N` with `Σ s_i · y_i`. Init
+            # at 1/√N reproduces the original behaviour exactly. Used
+            # to test whether equal-weight slice summation is washing
+            # out discriminative signal across the N=58 slices.
+            if os.environ.get("OPTICAL_FC_SLICE_WEIGHTS", "0") == "1":
+                init_w = 1.0 / math.sqrt(self.n_slices)
+                self.slice_weights = nn.Parameter(
+                    torch.full((self.n_slices,), init_w)
+                )
+            else:
+                self.slice_weights = None
         else:
+            # Legacy mode: slice weights only supported with clean FC.
+            self.slice_weights = None
             # Legacy: bias + running mean subtraction (bias is effectively
             # killed by the mean subtraction; kept for backward compat).
             self.bias = nn.Parameter(torch.randn(r) * 0.1)
@@ -328,6 +344,7 @@ class OpticalSharedLinear(nn.Module):
 
     def _print_architecture(self):
         mode = "Clean (no decoder, diagonal affine)" if self.use_clean_fc else "Legacy (decoder + DC-cancel)"
+        agg = "learnable per-slice" if self.slice_weights is not None else "fixed 1/√N"
         print(f"\n{'='*70}")
         print(f"OpticalSharedLinear Initialized ({mode})")
         print(f"{'='*70}")
@@ -335,6 +352,7 @@ class OpticalSharedLinear(nn.Module):
         print(f"Slices (N): {self.n_slices}")
         print(f"Shared Weights (K): {self.num_processors} ({'Independent' if self.num_shared_weights is None else 'Shared'})")
         print(f"Total MZI Resources: {self.total_mzis}")
+        print(f"Slice Aggregation: {agg}")
         print(f"{'='*70}\n")
 
     def forward(self, x):
@@ -469,11 +487,15 @@ class OpticalSharedLinear(nn.Module):
             for i, p in enumerate(slice_processors):
                 p.hook_data['optical_output'] = output_power[:, i, :].detach().cpu().clone()
 
-        # Step 8: Sum over all N slices -> hidden (B, 10)
-        hidden = output_power.sum(dim=1)
-
-        # Step 9: Normalization
-        hidden = hidden / math.sqrt(self.n_slices)
+        # Step 8-9: Aggregate over N slices
+        if self.slice_weights is not None:
+            # Learnable per-slice weights (shared across pos/neg paths,
+            # broadcast over output ports). Init = 1/√N reproduces the
+            # equal-weight baseline exactly.
+            hidden = (output_power * self.slice_weights.view(1, -1, 1)).sum(dim=1)
+        else:
+            # Fixed equal-weight aggregation (original behaviour)
+            hidden = output_power.sum(dim=1) / math.sqrt(self.n_slices)
 
         return hidden
 
