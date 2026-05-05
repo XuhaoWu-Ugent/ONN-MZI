@@ -17,31 +17,34 @@ conda activate onn
 nvidia-smi
 
 # ==========================================
-# SLOT 2: Learnable slice aggregation diagnostic
+# SLOT 2: Learnable slice aggregation diagnostic (CORRECTED, K=15)
 #
 # Hypothesis under test:
-#   The fixed `Σ y_i / √N` aggregation across N=58 slices smooths out
-#   discriminative signal. Replacing it with `Σ s_i · y_i` (58 trainable
-#   scalars, init at 1/√N to reproduce baseline at step 0) lets the
-#   model learn per-slice importance.
+#   With K=15 weight sharing, slices i, i+15, i+30, i+45 are forced
+#   through the SAME physical T matrix. The fixed equal-weight sum
+#   `Σ y_i / √N` then gives every slice the same importance even when
+#   they carry different amounts of discriminative signal. Replacing
+#   it with `Σ s_i · y_i` (58 trainable scalars, init 1/√N) lets each
+#   slice be weighted independently — something the shared T cannot
+#   express on its own.
 #
-# Configuration:
-#   K=58 (no weight sharing — every slice has its own physical processor)
-#     so the aggregation is the only shared component being tested.
-#   OPTICAL_FC_SLICE_WEIGHTS=1 enables the new learnable aggregation
-#     in module/optical_linear_shared.py.
+#   PRIOR ATTEMPT (incorrect): ran this at K=58. There each slice has
+#   its own independent T_i, so s_i is functionally absorbed by T_i in
+#   most of the dynamic range. Result was +0.3 pt (within noise) —
+#   that experiment tested the mechanism in the regime where it has
+#   no leverage. The correct test is at K=15.
 #
-# Pass/fail criterion:
-#   acc >= 90%   => slice aggregation is a real bottleneck; next step
-#                  is to upgrade to (N, 10) per-slice-per-port weights
-#                  (580 params, equivalent to a hidden electronic layer).
-#   acc ≈ 88.5%  => aggregation is NOT the bottleneck; rule out and move
-#                  attention to slot 1 result and mesh scaling.
+# Pass/fail criterion (vs K=15 fixed-agg baseline = 86.95%):
+#   acc >= 88%   => slice aggregation IS a bottleneck under sharing;
+#                  upgrade to (N, 10) per-slice-per-port weights worth
+#                  trying as a follow-up.
+#   acc ≈ 87%    => aggregation is not a bottleneck even when T is
+#                  shared; rule out and stop pursuing this direction.
 #
-# Baseline to beat (K=58, fixed aggregation, otherwise identical):
-#   88.46% (from clean_k-46750580.out K=58 run)
+# Baseline to beat (K=15, fixed aggregation, otherwise identical):
+#   86.95% (from test_fcclean-46632148.out)
 # ==========================================
-K_VALUE=58
+K_VALUE=15
 HIDDEN_CHANNELS=4
 FIXED_SIGMA=0.15
 KD_ALPHA=0.0
@@ -62,14 +65,16 @@ export SAVE_SUFFIX="_alpha${KD_ALPHA}_beta${KD_BETA}_K${K_VALUE}_fcclean_slicewt
 NUM_GPUS=$(python -c "import torch; print(torch.cuda.device_count())")
 
 echo "=========================================="
-echo "SLOT 2: Learnable slice aggregation (K=$K_VALUE)"
+echo "SLOT 2 (CORRECTED): Learnable slice aggregation under K=$K_VALUE sharing"
 echo "alpha=$KD_ALPHA, beta=$KD_BETA, K=$K_VALUE, ch=$HIDDEN_CHANNELS"
 echo "Epochs: $EPOCHS (pct_start=$ONECYCLE_PCT_START, final_div=$ONECYCLE_FINAL_DIV_FACTOR)"
 echo "OPTICAL_FC_CLEAN=$OPTICAL_FC_CLEAN"
 echo "OPTICAL_FC_SLICE_WEIGHTS=$OPTICAL_FC_SLICE_WEIGHTS  <-- new env hook"
 echo "Sigma: $FIXED_SIGMA"
 echo "Voltage: lr_mult=$VOLTAGE_LR_MULT, clamp=+/-${VOLTAGE_CLAMP_V}V, power=${POWER_BUDGET_MW}mW"
-echo "Baseline to beat (K=58, fixed aggregation): 88.46%"
+echo "Baseline to beat (K=15, fixed aggregation): 86.95%"
+echo "Mechanism leverage: at K=15 each T is shared by 4 slices, so per-slice"
+echo "  scaling cannot be absorbed by T (unlike K=58)."
 echo "=========================================="
 
 if [ ! -d "../data" ]; then
