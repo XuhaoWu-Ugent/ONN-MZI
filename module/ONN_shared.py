@@ -16,7 +16,8 @@ class OpticalNetwork(nn.Module):
                  mzi_row_num, mzi_column_num, num_layers=4, input_size=14, kernel_size=3,
                  detection_mode='coherent', use_optical_fc=True, fc_activation_mode='linear',
                  num_shared_weights=None, fc_pos_only: bool = False,
-                 input_phase_noise_sigma: float = 0.0):
+                 input_phase_noise_sigma: float = 0.0,
+                 fc_mzi_row_num=None, fc_mzi_column_num=None, fc_mzi_repeat_num=None):
         """
         Initialize the Optical Neural Network (Shared Weights)
 
@@ -41,6 +42,13 @@ class OpticalNetwork(nn.Module):
         self.num_shared_weights = num_shared_weights
         self.fc_pos_only = fc_pos_only
         self.input_phase_noise_sigma = input_phase_noise_sigma
+
+        # FC-side mesh dimensions can be set independently of the CNN's mesh
+        # (CNN is constrained by 3x3 patch -> 10 ports). When None, the FC
+        # inherits CNN values — preserves all existing behaviour.
+        self.fc_mzi_row_num = fc_mzi_row_num if fc_mzi_row_num is not None else mzi_row_num
+        self.fc_mzi_column_num = fc_mzi_column_num if fc_mzi_column_num is not None else mzi_column_num
+        self.fc_mzi_repeat_num = fc_mzi_repeat_num if fc_mzi_repeat_num is not None else mzi_repeat_num
 
         # Initialize network components
         self.layers = nn.ModuleList()
@@ -83,15 +91,21 @@ class OpticalNetwork(nn.Module):
             fc_start_index = self._calculate_total_mzis()
 
             use_clean_fc = os.environ.get('OPTICAL_FC_CLEAN', '0') == '1'
+            # FC mesh port count r is derived from fc_mzi_row_num (each row
+            # has fc_mzi_row_num MZIs ⇒ 2·fc_mzi_row_num optical ports). To
+            # scale the FC mesh past r=10 (the hardware-built size), set
+            # fc_mzi_row_num > 5 (and fc_mzi_column_num = fc_mzi_row_num - 1
+            # for port consistency). OpticalSharedLinear validates this.
+            r = self.fc_mzi_row_num * 2
             self.fc = OpticalSharedLinear(
                 in_features=self.feature_size,
                 out_features=output_size,
-                r=10,  # Hardware constraint
+                r=r,
                 activation_mode=self.fc_activation_mode,
-                detection_mode='power',  # Always use power mode
-                mzi_row_num=self.mzi_row_num,
-                mzi_column_num=self.mzi_column_num,
-                repeat_num=self.mzi_repeat_num,
+                detection_mode=detection_mode,
+                mzi_row_num=self.fc_mzi_row_num,
+                mzi_column_num=self.fc_mzi_column_num,
+                repeat_num=self.fc_mzi_repeat_num,
                 start_index=fc_start_index,
                 num_shared_weights=self.num_shared_weights, # Pass shared weights param
                 pos_only=self.fc_pos_only,

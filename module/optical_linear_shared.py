@@ -212,7 +212,22 @@ class OpticalSharedLinear(nn.Module):
         super(OpticalSharedLinear, self).__init__()
 
         # Validate parameters
-        if r != 10: raise ValueError(f"Rank r must be 10, got {r}")
+        if r <= 0 or r % 2 != 0:
+            raise ValueError(f"Rank r must be a positive even integer, got {r}")
+        # Mesh self-consistency:
+        #   row array num_ports = mzi_row_num * 2
+        #   column array num_ports = 2 * (mzi_column_num + 1)
+        # Both must equal r so layers can be cascaded with matching port counts.
+        if mzi_row_num * 2 != r:
+            raise ValueError(
+                f"mzi_row_num*2 ({mzi_row_num*2}) must equal r ({r}); "
+                f"set mzi_row_num={r//2}."
+            )
+        if mzi_column_num + 1 != mzi_row_num:
+            raise ValueError(
+                f"mzi_column_num+1 ({mzi_column_num+1}) must equal mzi_row_num "
+                f"({mzi_row_num}); set mzi_column_num={mzi_row_num-1}."
+            )
 
         self.in_features = in_features
         self.out_features = out_features
@@ -312,9 +327,24 @@ class OpticalSharedLinear(nn.Module):
                 )
             else:
                 self.slice_weights = None
+
+            # OPTIONAL: per-slice ReLU nonlinearity before aggregation.
+            # Default forward computes hidden = Σ_i (T_pos_i − T_neg_i) · x_i,
+            # which is linear in x. With this flag, we instead compute
+            #   hidden = Σ_i ReLU((T_pos_i − T_neg_i) · x_i)
+            # — each slice's signed dual-path output is rectified before
+            # aggregation. This is the cheapest test of whether the FC's
+            # piecewise-linear capacity is the bottleneck (single-FC nonlinear
+            # MLP), without cascading optical layers. Only enabled in clean
+            # FC mode and when both pos/neg paths are present.
+            self.use_per_slice_relu = (
+                os.environ.get("OPTICAL_FC_PER_SLICE_RELU", "0") == "1"
+                and not pos_only
+            )
         else:
-            # Legacy mode: slice weights only supported with clean FC.
+            # Legacy mode: slice weights & per-slice ReLU only in clean FC.
             self.slice_weights = None
+            self.use_per_slice_relu = False
             # Legacy: bias + running mean subtraction (bias is effectively
             # killed by the mean subtraction; kept for backward compat).
             self.bias = nn.Parameter(torch.randn(r) * 0.1)
@@ -345,6 +375,7 @@ class OpticalSharedLinear(nn.Module):
     def _print_architecture(self):
         mode = "Clean (no decoder, diagonal affine)" if self.use_clean_fc else "Legacy (decoder + DC-cancel)"
         agg = "learnable per-slice" if self.slice_weights is not None else "fixed 1/√N"
+        nonlin = "per-slice ReLU(diff_i) before sum" if self.use_per_slice_relu else "linear (signed sum)"
         print(f"\n{'='*70}")
         print(f"OpticalSharedLinear Initialized ({mode})")
         print(f"{'='*70}")
@@ -352,7 +383,9 @@ class OpticalSharedLinear(nn.Module):
         print(f"Slices (N): {self.n_slices}")
         print(f"Shared Weights (K): {self.num_processors} ({'Independent' if self.num_shared_weights is None else 'Shared'})")
         print(f"Total MZI Resources: {self.total_mzis}")
+        print(f"FC Detection Mode: {self.detection_mode.upper()}")
         print(f"Slice Aggregation: {agg}")
+        print(f"Slice Nonlinearity: {nonlin}")
         print(f"{'='*70}\n")
 
     def forward(self, x):
@@ -367,6 +400,32 @@ class OpticalSharedLinear(nn.Module):
         # Record FC input for hardware extraction
         if self._enable_fc_input_hook:
             self._fc_input_hook = x.detach().cpu().clone()
+
+        # === Per-slice ReLU branch (single nonlinear FC layer) ===
+        # When enabled, compute hidden = Σ_i ReLU(pos_i − neg_i) instead of
+        # the linear Σ_i (pos_i − neg_i). This breaks the FC out of the pure
+        # linear regime without adding a second optical layer. Only valid
+        # in clean FC mode and when both pos/neg paths exist (guarded in
+        # __init__ via self.use_per_slice_relu).
+        if self.use_per_slice_relu:
+            pos_per_slice = self.forward_encoder(
+                x, self.pos_encoder_slices, return_per_slice=True
+            )  # (B, N, r)
+            neg_per_slice = self.forward_encoder(
+                x, self.neg_encoder_slices, return_per_slice=True
+            )  # (B, N, r)
+            diff_per_slice = pos_per_slice - neg_per_slice
+            nonlinear = F.relu(diff_per_slice)  # (B, N, r), >= 0
+
+            if self.slice_weights is not None:
+                hidden = (nonlinear * self.slice_weights.view(1, -1, 1)).sum(dim=1)
+            else:
+                hidden = nonlinear.sum(dim=1) / math.sqrt(self.n_slices)
+
+            output = self.output_scale * hidden + self.output_shift
+            if self.output_proj is not None:
+                output = self.output_proj(output)
+            return output
 
         # === POSITIVE PATH ===
         pos_hidden = self.forward_encoder(x, self.pos_encoder_slices)
@@ -417,7 +476,7 @@ class OpticalSharedLinear(nn.Module):
 
         return output
 
-    def forward_encoder(self, x, slice_processors):
+    def forward_encoder(self, x, slice_processors, return_per_slice=False):
         batch_size = x.size(0)
         device = x.device
         num_slices = self.n_slices
@@ -486,6 +545,11 @@ class OpticalSharedLinear(nn.Module):
         if first_p.enable_hook:
             for i, p in enumerate(slice_processors):
                 p.hook_data['optical_output'] = output_power[:, i, :].detach().cpu().clone()
+
+        # Per-slice ReLU mode needs un-aggregated outputs so the caller
+        # can compute pos − neg per slice and rectify before summing.
+        if return_per_slice:
+            return output_power
 
         # Step 8-9: Aggregate over N slices
         if self.slice_weights is not None:
