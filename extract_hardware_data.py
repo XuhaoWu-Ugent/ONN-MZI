@@ -229,6 +229,11 @@ def collect_hardware_data():
         N = fc.n_slices  # 173
         r = fc.r  # 10
 
+        # Clean FC: decoder is None, bias is None, uses output_scale/output_shift
+        # Legacy FC: decoder + bias + running_logit_mean
+        is_clean_fc = getattr(fc, 'use_clean_fc', False) or (fc.pos_decoder_slice is None)
+        print(f"  FC mode: {'Clean (no decoder)' if is_clean_fc else 'Legacy (with decoder)'}")
+
         # 获取FC层输入
         with torch.no_grad():
             x = data_onn
@@ -256,13 +261,23 @@ def collect_hardware_data():
         print(f"  K={K} processors, N={N} slices")
 
         fc_res = {
-            'global_bias': fc.bias.detach().cpu().numpy().tolist(),
+            'fc_mode': 'clean' if is_clean_fc else 'legacy',
             'K': K,
             'N': N,
             'r': r,
             'encoders': [],  # 每个encoder处理的所有slices
-            'decoders': []
+            'decoders': []   # Empty list in clean mode
         }
+        if is_clean_fc:
+            # Clean mode: diagonal affine after (pos − neg)
+            fc_res['output_scale'] = fc.output_scale.detach().cpu().numpy().tolist()
+            fc_res['output_shift'] = fc.output_shift.detach().cpu().numpy().tolist()
+            fc_res['global_bias'] = None  # Kept for JSON schema compat; use output_shift instead
+        else:
+            # Legacy mode: fc.bias + running_logit_mean
+            fc_res['global_bias'] = fc.bias.detach().cpu().numpy().tolist()
+            if hasattr(fc, 'running_logit_mean'):
+                fc_res['running_logit_mean'] = fc.running_logit_mean.detach().cpu().numpy().tolist()
 
         # ===== Encoders: 记录每个processor处理的所有slices =====
         print(f"\n  Extracting encoders...")
@@ -338,39 +353,49 @@ def collect_hardware_data():
             print(f"    pos_hidden: {pos_hidden.cpu().numpy()}")
             print(f"    neg_hidden: {neg_hidden.cpu().numpy()}")
 
-            # ===== Decoders =====
-            print(f"\n  Extracting decoders...")
+            # ===== Decoders (Legacy only) =====
+            if is_clean_fc:
+                print(f"\n  Clean FC: skipping decoder extraction")
+            else:
+                print(f"\n  Extracting decoders...")
 
-            # Positive decoder
-            dec_pos = fc.pos_decoder_slice
-            dec_in_amp_pos = torch.sqrt(pos_hidden + 1e-10).to(torch.complex64)
-            dec_out_pos = compute_mzi_output_power(dec_pos, dec_in_amp_pos, device)
+                # Positive decoder
+                dec_pos = fc.pos_decoder_slice
+                dec_in_amp_pos = torch.sqrt(pos_hidden + 1e-10).to(torch.complex64)
+                dec_out_pos = compute_mzi_output_power(dec_pos, dec_in_amp_pos, device)
 
-            fc_res['decoders'].append({
-                'tag': 'dec_pos',
-                'path_type': 'positive',
-                'voltages': get_voltages(dec_pos),
-                'in_power': pos_hidden.cpu().numpy().tolist(),
-                'out_power': dec_out_pos.cpu().numpy().tolist()
-            })
+                fc_res['decoders'].append({
+                    'tag': 'dec_pos',
+                    'path_type': 'positive',
+                    'voltages': get_voltages(dec_pos),
+                    'in_power': pos_hidden.cpu().numpy().tolist(),
+                    'out_power': dec_out_pos.cpu().numpy().tolist()
+                })
 
-            # Negative decoder
-            dec_neg = fc.neg_decoder_slice
-            dec_in_amp_neg = torch.sqrt(neg_hidden + 1e-10).to(torch.complex64)
-            dec_out_neg = compute_mzi_output_power(dec_neg, dec_in_amp_neg, device)
+                # Negative decoder
+                dec_neg = fc.neg_decoder_slice
+                dec_in_amp_neg = torch.sqrt(neg_hidden + 1e-10).to(torch.complex64)
+                dec_out_neg = compute_mzi_output_power(dec_neg, dec_in_amp_neg, device)
 
-            fc_res['decoders'].append({
-                'tag': 'dec_neg',
-                'path_type': 'negative',
-                'voltages': get_voltages(dec_neg),
-                'in_power': neg_hidden.cpu().numpy().tolist(),
-                'out_power': dec_out_neg.cpu().numpy().tolist()
-            })
+                fc_res['decoders'].append({
+                    'tag': 'dec_neg',
+                    'path_type': 'negative',
+                    'voltages': get_voltages(dec_neg),
+                    'in_power': neg_hidden.cpu().numpy().tolist(),
+                    'out_power': dec_out_neg.cpu().numpy().tolist()
+                })
 
-            print(f"  Extracted {len(fc_res['decoders'])} decoder entries")
+                print(f"  Extracted {len(fc_res['decoders'])} decoder entries")
+
+            # Final output: use the model's actual forward instead of
+            # manually replicating the post-mesh aggregation. This stays
+            # correct under any combination of optical_linear_shared.py
+            # forward variants (slice_weights, per-slice ReLU, output_proj
+            # for r != out_features, etc.) without needing to keep this
+            # script in sync.
+            final_output = model(data_onn)
 
             # ===== 验证最终输出 =====
-            final_output = (dec_out_pos - dec_out_neg) + fc.bias
             pred = final_output.argmax(dim=-1).item()
             print(f"\n  Final output: {final_output.cpu().numpy().flatten()}")
             print(f"  Prediction: {pred}, Target: {target.item()}, Correct: {pred == target.item()}")
@@ -400,12 +425,15 @@ def collect_hardware_data():
     print(f"    Filters: 12 × 2 paths = 24 entries")
     print(f"    Each entry: 144 patches × 10 ports")
     print(f"    Total CNN data points: 24 × 144 × 10 = 34,560")
-    print(f"\n  FC Layer:")
+    fc_mode = results['fc'].get('fc_mode', 'legacy')
+    print(f"\n  FC Layer ({fc_mode} mode):")
     print(f"    Encoders: {K} × 2 paths = {K*2} entries")
     total_slices = sum(len(e['slice_indices']) for e in results['fc']['encoders'])
     print(f"    Total slices covered: {total_slices // 2} × 2 = {total_slices}")
-    print(f"    Decoders: 2 entries")
-    print(f"    Total FC data points: {total_slices} × 10 + 2 × 10 = {total_slices * 10 + 20}")
+    dec_count = len(results['fc']['decoders'])
+    print(f"    Decoders: {dec_count} entries" + (" (Clean FC: no decoder)" if dec_count == 0 else ""))
+    fc_points = total_slices * 10 + dec_count * 10
+    print(f"    Total FC data points: {total_slices} × 10 + {dec_count} × 10 = {fc_points}")
     print("="*60 + "\n")
 
     return results

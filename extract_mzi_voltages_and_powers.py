@@ -80,21 +80,29 @@ def collect_hardware_data():
     ).to(device)
 
     # 2. Load the best weights
-    checkpoint_path = f"distilled_shared_K{args.num_shared_weights}_ch{args.hidden_channels}_full_distill_best.pt"
-    if not os.path.exists(checkpoint_path):
-        checkpoint_path = f"distilled_shared_K{args.num_shared_weights}_full_distill_best.pt"
-    if not os.path.exists(checkpoint_path):
-        checkpoint_path = f"distilled_shared_K{args.num_shared_weights}_alpha0.5_sigma0.15_best.pt"
-    if not os.path.exists(checkpoint_path):
-        checkpoint_path = f"distilled_shared_K{args.num_shared_weights}_best.pt"
-    if not os.path.exists(checkpoint_path):
-        checkpoint_path = f"optimized_shared_K{args.num_shared_weights}_ch{args.hidden_channels}_best.pt"
-    if not os.path.exists(checkpoint_path):
-        checkpoint_path = f"optimized_shared_K{args.num_shared_weights}_best.pt"
-    
-    if not os.path.exists(checkpoint_path):
-        print(f"Error: No checkpoint found.")
-        return
+    checkpoint_override = os.environ.get('CHECKPOINT_PATH', '').strip()
+    if checkpoint_override:
+        if not os.path.exists(checkpoint_override):
+            print(f"Error: CHECKPOINT_PATH={checkpoint_override} does not exist.")
+            return
+        checkpoint_path = checkpoint_override
+        print(f"Using checkpoint from CHECKPOINT_PATH env: {checkpoint_path}")
+    else:
+        checkpoint_path = f"distilled_shared_K{args.num_shared_weights}_ch{args.hidden_channels}_full_distill_best.pt"
+        if not os.path.exists(checkpoint_path):
+            checkpoint_path = f"distilled_shared_K{args.num_shared_weights}_full_distill_best.pt"
+        if not os.path.exists(checkpoint_path):
+            checkpoint_path = f"distilled_shared_K{args.num_shared_weights}_alpha0.5_sigma0.15_best.pt"
+        if not os.path.exists(checkpoint_path):
+            checkpoint_path = f"distilled_shared_K{args.num_shared_weights}_best.pt"
+        if not os.path.exists(checkpoint_path):
+            checkpoint_path = f"optimized_shared_K{args.num_shared_weights}_ch{args.hidden_channels}_best.pt"
+        if not os.path.exists(checkpoint_path):
+            checkpoint_path = f"optimized_shared_K{args.num_shared_weights}_best.pt"
+
+        if not os.path.exists(checkpoint_path):
+            print(f"Error: No checkpoint found.")
+            return
     
     print(f"Loading weights from {checkpoint_path}...")
     model.load_state_dict(torch.load(checkpoint_path, map_location=device))
@@ -161,13 +169,13 @@ def collect_hardware_data():
 
         # Handle in_power
         if override_input_power is not None:
-            info['in_power'] = override_input_power.cpu().numpy() if torch.is_tensor(override_input_power) else override_input_power
+            info['in_power'] = override_input_power.detach().cpu().numpy() if torch.is_tensor(override_input_power) else override_input_power
         else:
             info['in_power'] = module.hook_data['optical_input'].numpy() if module.hook_data['optical_input'] is not None else None
 
         # Handle out_power
         if override_output_power is not None:
-            info['out_power'] = override_output_power.cpu().numpy() if torch.is_tensor(override_output_power) else override_output_power
+            info['out_power'] = override_output_power.detach().cpu().numpy() if torch.is_tensor(override_output_power) else override_output_power
         else:
             info['out_power'] = module.hook_data['optical_output'].numpy() if module.hook_data['optical_output'] is not None else None
 
@@ -228,12 +236,25 @@ def collect_hardware_data():
         else:
             print(f"FC input shape: {fc_input.shape}")  # (batch, in_features)
 
+        # Clean FC: decoder is None, bias is None, uses output_scale/output_shift
+        # Legacy FC: decoder + bias + running_logit_mean
+        is_clean_fc = getattr(fc, 'use_clean_fc', False) or (fc.pos_decoder_slice is None)
+        print(f"FC mode: {'Clean (no decoder)' if is_clean_fc else 'Legacy (with decoder)'}")
+
         fc_res = {
-            'global_bias': fc.bias.detach().cpu().numpy(),
+            'fc_mode': 'clean' if is_clean_fc else 'legacy',
             'n_slices': fc.n_slices,
             'num_processors': fc.num_processors,
             'processors': []  # 保留原结构
         }
+        if is_clean_fc:
+            fc_res['output_scale'] = fc.output_scale.detach().cpu().numpy()
+            fc_res['output_shift'] = fc.output_shift.detach().cpu().numpy()
+            fc_res['global_bias'] = None
+        else:
+            fc_res['global_bias'] = fc.bias.detach().cpu().numpy()
+            if hasattr(fc, 'running_logit_mean'):
+                fc_res['running_logit_mean'] = fc.running_logit_mean.detach().cpu().numpy()
 
         # 计算所有 slice 的输入输出
         if fc_input is not None:
@@ -339,43 +360,47 @@ def collect_hardware_data():
             pos_hidden = pos_hidden_accum / (fc.n_slices ** 0.5)
             neg_hidden = neg_hidden_accum / (fc.n_slices ** 0.5)
 
-            # 2. 提取 Decoders (成对: Pos, Neg)
-            def compute_decoder_output(decoder, hidden_input):
-                hidden_input = torch.abs(hidden_input)
-                x_amp = torch.sqrt(hidden_input + 1e-8).to(torch.complex64)
-                combined_matrix = decoder._get_combined_matrix(device)
-                output_power = torch.zeros(batch_size, num_ports, dtype=torch.float32, device=device)
-                for port_idx in range(num_ports):
-                    state = torch.zeros(batch_size, matrix_size, dtype=torch.complex64, device=device)
-                    state[:, port_idx] = x_amp[:, port_idx]
-                    new_state = torch.matmul(state, combined_matrix.T)
-                    output_power += torch.abs(new_state[:, num_ports:2*num_ports]) ** 2
-                return output_power
+            # 2. 提取 Decoders (成对: Pos, Neg) — Legacy only
+            if is_clean_fc:
+                print("  Clean FC: skipping decoder extraction")
+            else:
+                def compute_decoder_output(decoder, hidden_input):
+                    hidden_input = torch.abs(hidden_input)
+                    x_amp = torch.sqrt(hidden_input + 1e-8).to(torch.complex64)
+                    combined_matrix = decoder._get_combined_matrix(device)
+                    output_power = torch.zeros(batch_size, num_ports, dtype=torch.float32, device=device)
+                    for port_idx in range(num_ports):
+                        state = torch.zeros(batch_size, matrix_size, dtype=torch.complex64, device=device)
+                        state[:, port_idx] = x_amp[:, port_idx]
+                        new_state = torch.matmul(state, combined_matrix.T)
+                        output_power += torch.abs(new_state[:, num_ports:2*num_ports]) ** 2
+                    return output_power
 
-            pos_dec_output = compute_decoder_output(fc.pos_decoder_slice, pos_hidden)
-            neg_dec_output = compute_decoder_output(fc.neg_decoder_slice, neg_hidden)
+                pos_dec_output = compute_decoder_output(fc.pos_decoder_slice, pos_hidden)
+                neg_dec_output = compute_decoder_output(fc.neg_decoder_slice, neg_hidden)
 
-            fc_res['processors'].append({
-                'tag': 'dec_pos',
-                'path_type': 'positive',
-                'component_type': 'decoder',
-                'voltages': get_processor_voltages(fc.pos_decoder_slice),
-                'in_power': pos_hidden.detach().cpu().numpy(),
-                'out_power': pos_dec_output.detach().cpu().numpy(),
-            })
-            fc_res['processors'].append({
-                'tag': 'dec_neg',
-                'path_type': 'negative',
-                'component_type': 'decoder',
-                'voltages': get_processor_voltages(fc.neg_decoder_slice),
-                'in_power': neg_hidden.detach().cpu().numpy(),
-                'out_power': neg_dec_output.detach().cpu().numpy(),
-            })
+                fc_res['processors'].append({
+                    'tag': 'dec_pos',
+                    'path_type': 'positive',
+                    'component_type': 'decoder',
+                    'voltages': get_processor_voltages(fc.pos_decoder_slice),
+                    'in_power': pos_hidden.detach().cpu().numpy(),
+                    'out_power': pos_dec_output.detach().cpu().numpy(),
+                })
+                fc_res['processors'].append({
+                    'tag': 'dec_neg',
+                    'path_type': 'negative',
+                    'component_type': 'decoder',
+                    'voltages': get_processor_voltages(fc.neg_decoder_slice),
+                    'in_power': neg_hidden.detach().cpu().numpy(),
+                    'out_power': neg_dec_output.detach().cpu().numpy(),
+                })
 
         results['fc'] = fc_res
 
     # 7. Save (NPY + JSON)
-    base_name = f"mzi_hardware_data_K{args.num_shared_weights}_ch{args.hidden_channels}_full_distill"
+    hw_data_suffix = os.environ.get('HW_DATA_SUFFIX', '').strip()
+    base_name = f"mzi_hardware_data_K{args.num_shared_weights}_ch{args.hidden_channels}_full_distill{hw_data_suffix}"
     npy_path = f"results/{base_name}.npy"
     json_path = f"results/{base_name}.json"
 
@@ -433,10 +458,12 @@ def collect_hardware_data():
     if hasattr(model, 'fc') and 'processors' in results['fc']:
         fc_data = results['fc']
         num_enc = fc_data['num_processors']
-        print(f"\n  FC Layer:")
+        mode = fc_data.get('fc_mode', 'legacy')
+        print(f"\n  FC Layer ({mode} mode):")
         print(f"    Total slices (N): {fc_data['n_slices']}")
         print(f"    Physical processors (K): {fc_data['num_processors']}")
-        print(f"    Processor entries: {len(fc_data['processors'])} ({num_enc}×2 encoders + 2 decoders)")
+        dec_count = 0 if mode == 'clean' else 2
+        print(f"    Processor entries: {len(fc_data['processors'])} ({num_enc}×2 encoders + {dec_count} decoders)")
         # 验证 encoder 数据
         enc0_pos = fc_data['processors'][0]
         if enc0_pos['in_power'] is not None:
