@@ -26,7 +26,7 @@ def get_args():
                             help='Input image size')
     arch_group.add_argument('--input-channels', type=int, default=1,
                             help='Number of input channels (1 for grayscale)')
-    arch_group.add_argument('--hidden-channels', type=int, default=12,
+    arch_group.add_argument('--hidden-channels', type=int, default=4,
                             help='Number of channels in all layers')
     arch_group.add_argument('--num-layers', type=int, default=1,
                             help='Number of CNN layers')
@@ -43,6 +43,16 @@ def get_args():
                            help='Number of MZIs per row in MZI array')
     mzi_group.add_argument('--mzi-column-num', type=int, default=4,
                            help='Number of MZIs per column in MZI array')
+    mzi_group.add_argument('--fc-mzi-repeat-num', type=int, default=None,
+                           help='FC-only MZI layer repetitions (default: same as --mzi-repeat-num). '
+                                'Used to scale FC mesh independently of CNN mesh, '
+                                'e.g. for the r=20+ mesh-size scaling outlook experiment.')
+    mzi_group.add_argument('--fc-mzi-row-num', type=int, default=None,
+                           help='FC-only MZIs per row (default: same as --mzi-row-num). '
+                                'FC mesh port count r = 2*this. To scale to r=20 set 10, r=40 set 20.')
+    mzi_group.add_argument('--fc-mzi-column-num', type=int, default=None,
+                           help='FC-only MZIs per column (default: same as --mzi-column-num). '
+                                'Must equal fc-mzi-row-num - 1 for port consistency.')
     mzi_group.add_argument('--lossless-mzi', action='store_true', default=True,
                            help='Disable MZI insertion loss during training/inference (default: lossless)')
     mzi_group.add_argument('--lossy-mzi', dest='lossless_mzi', action='store_false',

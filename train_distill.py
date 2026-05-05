@@ -457,7 +457,10 @@ def main():
         detection_mode=args.detection_mode, use_optical_fc=args.use_optical_fc,
         fc_activation_mode=args.fc_activation_mode, num_shared_weights=args.num_shared_weights,
         fc_pos_only=args.fc_pos_only,
-        input_phase_noise_sigma=args.input_phase_noise_sigma
+        input_phase_noise_sigma=args.input_phase_noise_sigma,
+        fc_mzi_row_num=args.fc_mzi_row_num,
+        fc_mzi_column_num=args.fc_mzi_column_num,
+        fc_mzi_repeat_num=args.fc_mzi_repeat_num,
     ).to(device)
     
     load_mzi_calibration(student, 'results/mzi_parameters_multi.json')
