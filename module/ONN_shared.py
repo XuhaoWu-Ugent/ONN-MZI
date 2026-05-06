@@ -97,20 +97,35 @@ class OpticalNetwork(nn.Module):
             # fc_mzi_row_num > 5 (and fc_mzi_column_num = fc_mzi_row_num - 1
             # for port consistency). OpticalSharedLinear validates this.
             r = self.fc_mzi_row_num * 2
-            self.fc = OpticalSharedLinear(
-                in_features=self.feature_size,
-                out_features=output_size,
-                r=r,
-                activation_mode=self.fc_activation_mode,
-                detection_mode=detection_mode,
-                mzi_row_num=self.fc_mzi_row_num,
-                mzi_column_num=self.fc_mzi_column_num,
-                repeat_num=self.fc_mzi_repeat_num,
-                start_index=fc_start_index,
-                num_shared_weights=self.num_shared_weights, # Pass shared weights param
-                pos_only=self.fc_pos_only,
-                use_clean_fc=use_clean_fc,
-            )
+
+            # Diagnostic hook: replace the optical FC with a mesh-free
+            # ConstrainedLinearFC that imposes the same mathematical
+            # constraints (non-negativity, column-sum, K-way sharing,
+            # block structure) directly via softmax-bounded parameters.
+            # See module/constrained_linear_fc.py for rationale.
+            if os.environ.get('USE_CONSTRAINED_FC', '0') == '1':
+                from module.constrained_linear_fc import ConstrainedLinearFC
+                self.fc = ConstrainedLinearFC(
+                    in_features=self.feature_size,
+                    out_features=output_size,
+                    r=r,
+                    num_shared_weights=self.num_shared_weights,
+                )
+            else:
+                self.fc = OpticalSharedLinear(
+                    in_features=self.feature_size,
+                    out_features=output_size,
+                    r=r,
+                    activation_mode=self.fc_activation_mode,
+                    detection_mode=detection_mode,
+                    mzi_row_num=self.fc_mzi_row_num,
+                    mzi_column_num=self.fc_mzi_column_num,
+                    repeat_num=self.fc_mzi_repeat_num,
+                    start_index=fc_start_index,
+                    num_shared_weights=self.num_shared_weights, # Pass shared weights param
+                    pos_only=self.fc_pos_only,
+                    use_clean_fc=use_clean_fc,
+                )
         else:
             # Use electronic linear layer
             self.fc = nn.Linear(self.feature_size, output_size)
