@@ -474,6 +474,12 @@ def load_init_parameters(model: MZIArray, json_path: str) -> None:
     Supports both old format (with delta_r) and new format (with p_pi).
     Old delta_r values are ignored since resistance is now fixed from measurement.
     Respects frozen parameters: skips p_pi/phi0 if requires_grad is False.
+
+    Also restores global hardware fields when present in the source JSON:
+      _alpha_R, _det_gain, _noise_floor_uw, _crosstalk (with _refarm_xt).
+    Restoration is done by inverting the bounded transforms in train.MZIArray
+    so the loaded forward pass exactly reproduces the source JSON's effective
+    parameters (e.g. v5d → eval RMSE = original v5d run's RMSE).
     """
     with open(json_path, "r", encoding="utf-8") as f:
         params = json.load(f)
@@ -483,25 +489,93 @@ def load_init_parameters(model: MZIArray, json_path: str) -> None:
         key = str(mzi.index)
         if key in params:
             p = params[key]
-            kwargs = {
-                "a": p["a"],
-                "b": p["b"],
-            }
+            kwargs = {}
+            # All fields optional so this also accepts mzi_measured_physics.json
+            # (which lacks a/b/alpha/delta_r) as the init-params source.
+            if "a" in p:
+                kwargs["a"] = p["a"]
+            if "b" in p:
+                kwargs["b"] = p["b"]
             if "delta_r" in p:
                 kwargs["delta_r"] = p["delta_r"]
-            # Only load phi0 if it's still trainable
-            if mzi._raw_phi0.requires_grad:
+            if mzi._raw_phi0.requires_grad and "phi0" in p:
                 kwargs["phi0"] = p["phi0"]
-            # Only load p_pi if it's still trainable
             if mzi._raw_p_pi.requires_grad and "p_pi" in p:
                 kwargs["p_pi"] = p["p_pi"]
-            # Only load alpha if it's still trainable
             if mzi._raw_alpha.requires_grad and "alpha" in p:
                 kwargs["alpha"] = p["alpha"]
-            mzi.load_physical_parameters(**kwargs)
-            loaded += 1
+            if kwargs:
+                mzi.load_physical_parameters(**kwargs)
+                loaded += 1
 
     print(f"Loaded initial parameters for {loaded} MZIs from {json_path}")
+
+    # --- Global hardware fields ------------------------------------------------
+    # Inverse-transform JSON values back to _raw_* parameters so that the
+    # forward pass after loading matches the source run exactly.
+    eps = 1e-6
+
+    def _logit(x: torch.Tensor) -> torch.Tensor:
+        x = torch.clamp(x, eps, 1.0 - eps)
+        return torch.log(x / (1.0 - x))
+
+    def _atanh(x: torch.Tensor) -> torch.Tensor:
+        x = torch.clamp(x, -1.0 + eps, 1.0 - eps)
+        return 0.5 * torch.log((1.0 + x) / (1.0 - x))
+
+    restored = []
+
+    # alpha_R: forward = 0.05 * sigmoid(_raw_alpha_R)
+    if "_alpha_R" in params:
+        aR = torch.tensor(float(params["_alpha_R"]) / 0.05)
+        model._raw_alpha_R.data.fill_(_logit(aR).item())
+        restored.append(f"_alpha_R={float(params['_alpha_R']):.4e}")
+
+    # det_gain: forward = 0.3 * tanh(_raw_det_gain)  (per-port, 10 values)
+    if "_det_gain" in params:
+        dg = torch.tensor(params["_det_gain"], dtype=torch.float32) / 0.3
+        model._raw_det_gain.data.copy_(_atanh(dg))
+        restored.append("_det_gain[10]")
+
+    # noise_floor: forward = 0.001 * sigmoid(_raw_noise_floor) [mW]
+    # JSON stores values in μW (= mW × 1000), so divide by 1000 first.
+    if "_noise_floor_uw" in params:
+        nf_mw = torch.tensor(params["_noise_floor_uw"], dtype=torch.float32) / 1000.0
+        nf_norm = nf_mw / 0.001
+        model._raw_noise_floor.data.copy_(_logit(nf_norm))
+        restored.append("_noise_floor_uw[10]")
+
+    # crosstalk: heated arm coeff = _raw_crosstalk * 0.01
+    # reference arm coeff       = softplus(_raw_refarm_xt) * 0.01
+    if "_crosstalk" in params and getattr(model, "enable_crosstalk", False):
+        xt = params["_crosstalk"]
+        coeff_map = {(x["dst"], x["src"]): x["coeff"] for x in xt}
+        refarm_map = {(x["dst"], x["src"]): x.get("refarm", 0.0) for x in xt}
+
+        n = len(model.crosstalk_pairs)
+        c_raw = torch.zeros(n)
+        # If _raw_refarm_xt is registered, default it to its init value (-20).
+        has_refarm = hasattr(model, "_raw_refarm_xt")
+        r_raw = torch.full((n,), -20.0) if has_refarm else None
+
+        matched = 0
+        for k, (i, j) in enumerate(model.crosstalk_pairs):
+            if (i, j) in coeff_map:
+                c_raw[k] = coeff_map[(i, j)] / 0.01
+                if has_refarm:
+                    ref = max(float(refarm_map[(i, j)]), 0.0) / 0.01
+                    if ref > 1e-12:
+                        # softplus⁻¹(y) = log(exp(y) − 1) = log(expm1(y))
+                        r_raw[k] = torch.log(torch.expm1(torch.tensor(ref))).item()
+                matched += 1
+
+        model._raw_crosstalk.data.copy_(c_raw)
+        if has_refarm:
+            model._raw_refarm_xt.data.copy_(r_raw)
+        restored.append(f"_crosstalk[{matched}/{n} pairs]")
+
+    if restored:
+        print(f"  + restored global fields: {', '.join(restored)}")
 
 
 def export_parameters(model: MZIArray, output_file: str) -> None:
@@ -767,6 +841,7 @@ def train_model(args: argparse.Namespace) -> MZIArray:
     print(f"  Parameters: {n_trainable} trainable / {n_total} total")
 
     best_val_loss = float("inf")
+    history = []  # per-epoch (train_loss, val_loss) for the training-curve figure
 
     for epoch in range(1, args.epochs + 1):
         model.train()
@@ -826,6 +901,9 @@ def train_model(args: argparse.Namespace) -> MZIArray:
 
         scheduler.step(train_loss)
 
+        history.append({"epoch": epoch, "train_loss": float(train_loss),
+                        "val_loss": float(val_loss), "elapsed_s": float(elapsed)})
+
         # Save best model by val loss
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -870,6 +948,11 @@ def train_model(args: argparse.Namespace) -> MZIArray:
     if val_configs and best_val_loss < float("inf"):
         model.load_state_dict(best_state)
         print(f"\nRestored best model (val_loss={best_val_loss:.6e})")
+
+    if args.log_history:
+        with open(args.log_history, "w", encoding="utf-8") as fh:
+            json.dump(history, fh, indent=2)
+        print(f"Per-epoch training history written to {args.log_history}")
 
     return model
 
@@ -1001,6 +1084,13 @@ def build_argparser() -> argparse.ArgumentParser:
         default=1e2,
         help="Soft regularization weight for phi0 toward measured values (default: 1e2). "
              "Lower than lambda_p_pi because phi0 measurement has larger uncertainty.",
+    )
+    parser.add_argument(
+        "--log-history",
+        type=str,
+        default=None,
+        help="If set, write a JSON list of per-epoch (epoch, train_loss, val_loss, "
+             "elapsed_s) to this path. Used by the training-curve figure.",
     )
     return parser
 
