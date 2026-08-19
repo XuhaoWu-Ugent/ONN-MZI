@@ -75,14 +75,14 @@ class ResNet18MNIST(nn.Module):
         super().__init__()
         # Load standard ResNet18
         self.model = models.resnet18(weights=None) # We train from scratch for MNIST
-        
+
         # Modify first layer: 1 channel input (instead of 3), kernel 3x3 (instead of 7x7 for ImageNet)
         # This helps with small images like MNIST/CIFAR
         self.model.conv1 = nn.Conv2d(1, 64, kernel_size=3, stride=1, padding=1, bias=False)
-        
+
         # Remove maxpool to preserve spatial dimensions for small images
         self.model.maxpool = nn.Identity()
-        
+
         # Modify FC layer
         self.model.fc = nn.Linear(self.model.fc.in_features, num_classes)
 
@@ -99,10 +99,10 @@ class ResNet18MNIST(nn.Module):
         x = self.model.layer4(x)
 
         features = self.model.avgpool(x)
-        
+
         x = torch.flatten(features, 1)
         logits = self.model.fc(x)
-        
+
         if return_features:
             return logits, features
         return logits
@@ -112,19 +112,18 @@ class DynamicGaussianNoise(object):
     def __init__(self, mean=0., std=0.):
         self.std = std
         self.mean = mean
-    
+
     def set_std(self, new_std):
         self.std = new_std
-        
+
     def __call__(self, tensor):
         if self.std <= 0: return tensor
         return tensor + torch.randn(tensor.size()) * self.std + self.mean
 
 # === 3. Helper: Train the Teacher (if not exists) ===
-def train_teacher_if_needed(device, train_loader, test_loader, rank=0):
-    path = "teacher_resnet18_mnist.pt"
+def train_teacher_if_needed(device, train_loader, test_loader, rank=0, path="teacher_resnet18_mnist.pt"):
     model = ResNet18MNIST().to(device)
-    
+
     if os.path.exists(path):
         if rank == 0:
             print(f"[Teacher] Loading pre-trained Teacher from {path}")
@@ -136,11 +135,11 @@ def train_teacher_if_needed(device, train_loader, test_loader, rank=0):
 
     if rank == 0:
         print("[Teacher] No pre-trained teacher found. Training ResNet18 on MNIST...")
-    
+
     # Simple training loop for Teacher
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     criterion = nn.CrossEntropyLoss()
-    
+
     # Train for 5 epochs
     for epoch in range(5):
         model.train()
@@ -149,13 +148,13 @@ def train_teacher_if_needed(device, train_loader, test_loader, rank=0):
             # Downsample strategy for training
             data_small = F.interpolate(data, size=(14, 14), mode='bilinear', align_corners=False)
             data_upscaled = F.interpolate(data_small, size=(32, 32), mode='bilinear', align_corners=False)
-            
+
             optimizer.zero_grad()
             output = model(data_upscaled)
             loss = criterion(output, target)
             loss.backward()
             optimizer.step()
-        
+
         if rank == 0:
             print(f"[Teacher] Epoch {epoch+1}/5 training completed.")
 
@@ -169,12 +168,12 @@ def train_teacher_if_needed(device, train_loader, test_loader, rank=0):
             # Use same downsample strategy for evaluation
             data_small = F.interpolate(data, size=(14, 14), mode='bilinear', align_corners=False)
             data_upscaled = F.interpolate(data_small, size=(32, 32), mode='bilinear', align_corners=False)
-            
+
             output = model(data_upscaled)
             pred = output.argmax(dim=1)
             correct += pred.eq(target).sum().item()
             total += target.size(0)
-    
+
     # Sync metrics
     if dist.is_initialized():
         c_tensor = torch.tensor([correct], device=device)
@@ -194,14 +193,14 @@ def train_teacher_if_needed(device, train_loader, test_loader, rank=0):
     if rank == 0:
         torch.save(model.state_dict(), path)
         print(f"[Teacher] Saved to {path}")
-    
+
     # Sync processes to ensure file exists before others load
     if dist.is_initialized():
         dist.barrier()
         # Reload to ensure consistency
         state_dict = torch.load(path, map_location=device, weights_only=True)
         model.load_state_dict(state_dict)
-        
+
     model.eval()
     return model
 
@@ -214,7 +213,7 @@ def distillation_loss(student_logits, teacher_logits, temperature=4.0, alpha=0.5
     soft_targets = F.softmax(teacher_logits / temperature, dim=1)
     # Log softmax from student
     student_log_softmax = F.log_softmax(student_logits / temperature, dim=1)
-    
+
     # KL Divergence
     distill_loss = F.kl_div(student_log_softmax, soft_targets, reduction='batchmean')
     return distill_loss
@@ -225,18 +224,18 @@ def train_distill(student, teacher, device, train_loader, optimizer, epoch, scal
     student.train()
     feature_adapter.train() 
     teacher.eval()
-    
+
     epoch_loss = 0.0
     epoch_correct = 0
     total_samples = 0
-    
+
     criterion_ce = torch.nn.CrossEntropyLoss(label_smoothing=0.1)
     criterion_feat = torch.nn.MSELoss() 
-    
+
     TEMP = 4.0
     KD_ALPHA = float(os.environ.get('DISTILL_ALPHA', 0.5))
     KD_BETA = float(os.environ.get('DISTILL_BETA', 1.0))
-    
+
     # === Weight Noise Config ===
     sigma_weight = args.weight_noise_sigma
     if rank == 0 and epoch == 1 and sigma_weight > 0:
@@ -244,12 +243,12 @@ def train_distill(student, teacher, device, train_loader, optimizer, epoch, scal
 
     for batch_idx, (data, target) in enumerate(train_loader):
         data, target = data.to(device), target.to(device)
-        
+
         # --- Data Preparation ---
         with torch.no_grad():
             low_res_data = F.interpolate(data, size=(args.input_size, args.input_size), mode='bilinear', align_corners=False)
             teacher_input = F.interpolate(low_res_data, size=(32, 32), mode='bilinear', align_corners=False)
-            
+
             # Get Teacher Logits AND Features
             teacher_logits, teacher_feat = teacher(teacher_input, return_features=True)
             teacher_feat = torch.flatten(teacher_feat, 1)
@@ -257,9 +256,9 @@ def train_distill(student, teacher, device, train_loader, optimizer, epoch, scal
         student_input = low_res_data.clone()
         if current_sigma > 0:
             student_input = student_input + torch.randn_like(student_input) * current_sigma
-        
+
         optimizer.zero_grad()
-        
+
         # === 1. Inject Voltage Noise (Physical MZI Channels) ===
         saved_params = {}
         if sigma_weight > 0:
@@ -269,7 +268,7 @@ def train_distill(student, teacher, device, train_loader, optimizer, epoch, scal
                     noise = torch.randn_like(param) * sigma_weight
                     param.data.add_(noise)
         # ======================================
-        
+
         use_cuda = not args.no_cuda and torch.cuda.is_available()
         with autocast("cuda" if use_cuda else "cpu"):
             # Get Student Logits AND Features
@@ -278,16 +277,16 @@ def train_distill(student, teacher, device, train_loader, optimizer, epoch, scal
 
             # Align Features
             student_feat_adapted = feature_adapter(student_feat)
-            
+
             # Calculate Losses
             loss_ce = criterion_ce(student_logits, target)
             loss_kd = distillation_loss(student_logits, teacher_logits, temperature=TEMP)
             loss_feat = criterion_feat(student_feat_adapted, teacher_feat)
-            
+
             loss = (1.0 - KD_ALPHA) * loss_ce + KD_ALPHA * loss_kd + KD_BETA * loss_feat
-            
+
         scaler.scale(loss).backward()
-        
+
         # === 2. Restore Clean Weights (ADDED) ===
         if sigma_weight > 0:
             for name, param in student.named_parameters():
@@ -333,14 +332,14 @@ def train_distill(student, teacher, device, train_loader, optimizer, epoch, scal
     return epoch_loss / total_samples, 100. * epoch_correct / total_samples
 
 # === 6. Ensemble Test (Updated for Weight Noise) ===
-def test_ensemble(model, device, test_loader, args, rank=0, num_repeats=5):
+def test_ensemble(model, device, test_loader, args, rank=0, num_repeats=5, name="Test"):
     model.eval()
     test_loss = 0
     correct = 0
-    
+
     # Prepare resizing transform
     resize = transforms.Resize((args.input_size, args.input_size))
-    
+
     # Weight Noise Config for Test
     sigma_weight = args.weight_noise_sigma
     original_weights = {}
@@ -354,7 +353,7 @@ def test_ensemble(model, device, test_loader, args, rank=0, num_repeats=5):
             data, target = data.to(device), target.to(device)
             # Resize for ONN
             data_onn = F.interpolate(data, size=(args.input_size, args.input_size), mode='bilinear', align_corners=False)
-            
+
             output_sum = None
             for _ in range(num_repeats):
                 # === Inject Voltage Noise for Ensemble (Physical MZI Channels) ===
@@ -364,7 +363,7 @@ def test_ensemble(model, device, test_loader, args, rank=0, num_repeats=5):
                             noise = torch.randn_like(param) * sigma_weight
                             param.data.copy_(original_weights[name] + noise)
                 # ========================================================
-                
+
                 output = model(data_onn)
                 if output_sum is None: output_sum = output
                 else: output_sum += output
@@ -374,7 +373,7 @@ def test_ensemble(model, device, test_loader, args, rank=0, num_repeats=5):
                 for name, param in model.named_parameters():
                     if param.requires_grad:
                         param.data.copy_(original_weights[name])
-            
+
             output_avg = output_sum / num_repeats
             test_loss += F.cross_entropy(output_avg, target, reduction='sum').item()
             pred = output_avg.argmax(dim=1, keepdim=True)
@@ -386,13 +385,13 @@ def test_ensemble(model, device, test_loader, args, rank=0, num_repeats=5):
         dist.all_reduce(l_tensor, op=dist.ReduceOp.SUM)
         dist.all_reduce(c_tensor, op=dist.ReduceOp.SUM)
         test_loss, correct = l_tensor.item(), int(c_tensor.item())
-    
+
     total_samples = len(test_loader.dataset)
     test_loss /= total_samples
     accuracy = 100. * correct / total_samples
 
     if rank == 0:
-        print(f'\nTest set (Ensemble {num_repeats}x): Avg loss: {test_loss:.4f}, Accuracy: {correct}/{total_samples} ({accuracy:.2f}%)\n')
+        print(f'\n{name} set (Ensemble {num_repeats}x): Avg loss: {test_loss:.4f}, Accuracy: {correct}/{total_samples} ({accuracy:.2f}%)\n')
     return test_loss, accuracy
 
 def load_mzi_parameters_from_json(model, json_path):
@@ -401,7 +400,7 @@ def load_mzi_parameters_from_json(model, json_path):
 
 def main():
     args = get_args()
-    
+
     is_distributed = 'RANK' in os.environ and 'WORLD_SIZE' in os.environ
     if is_distributed:
         dist.init_process_group(backend='nccl')
@@ -418,13 +417,13 @@ def main():
     random.seed(args.seed + rank)
     np.random.seed(args.seed + rank)
     torch.manual_seed(args.seed + rank)
-    
+
     # === Loaders ===
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.1307,), (0.3081,))
     ])
-    
+
     # Test set with target noise for monitoring
     test_noise_transform = DynamicGaussianNoise(0., args.input_noise_sigma)
     test_transform = transforms.Compose([
@@ -432,22 +431,52 @@ def main():
         transforms.Normalize((0.1307,), (0.3081,)),
         test_noise_transform
     ])
-    
+
     train_dataset = datasets.MNIST('../data', train=True, download=True, transform=transform)
     test_dataset = datasets.MNIST('../data', train=False, transform=test_transform)
+
+    # === Optional validation split (held out from the 60k training images) ===
+    # The split is a fixed permutation seeded by args.seed ONLY (not seed+rank),
+    # so every DDP rank holds out the identical images. The validation subset
+    # uses the test-time transform so that it is evaluated under the same
+    # conditions as the test set.
+    val_loader = None
+    val_dataset = None
+    if args.val_split > 0:
+        n_total = len(train_dataset)
+        if not (0 < args.val_split < n_total):
+            raise ValueError(f"--val-split must be in (0, {n_total}), got {args.val_split}")
+        perm = torch.randperm(n_total, generator=torch.Generator().manual_seed(args.seed)).tolist()
+        val_idx, train_idx = perm[:args.val_split], perm[args.val_split:]
+        val_base = datasets.MNIST('../data', train=True, download=False, transform=test_transform)
+        val_dataset = torch.utils.data.Subset(val_base, val_idx)
+        train_dataset = torch.utils.data.Subset(train_dataset, train_idx)
+        if rank == 0:
+            print(f"[Data] Validation split: {len(val_dataset)} held-out training images "
+                  f"(seed {args.seed}); training on {len(train_dataset)} images. "
+                  f"Model selection uses VALIDATION accuracy; test accuracy is only reported.")
 
     if is_distributed:
         train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank, shuffle=True)
         test_sampler = DistributedSampler(test_dataset, num_replicas=world_size, rank=rank, shuffle=False)
         train_loader = DataLoader(train_dataset, batch_size=args.batch_size, sampler=train_sampler, num_workers=4, pin_memory=True)
         test_loader = DataLoader(test_dataset, batch_size=args.test_batch_size, sampler=test_sampler, num_workers=4, pin_memory=True)
+        if val_dataset is not None:
+            val_sampler = DistributedSampler(val_dataset, num_replicas=world_size, rank=rank, shuffle=False)
+            val_loader = DataLoader(val_dataset, batch_size=args.test_batch_size, sampler=val_sampler, num_workers=4, pin_memory=True)
     else:
         train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4, pin_memory=True)
         test_loader = DataLoader(test_dataset, batch_size=args.test_batch_size, shuffle=False, num_workers=4, pin_memory=True)
-    
+        if val_dataset is not None:
+            val_loader = DataLoader(val_dataset, batch_size=args.test_batch_size, shuffle=False, num_workers=4, pin_memory=True)
+
     # === 1. Setup Teacher ===
-    teacher = train_teacher_if_needed(device, train_loader, test_loader, rank)
-    
+    # With a validation split the teacher is trained on the reduced training
+    # subset only (separate checkpoint file), so no held-out image leaks in.
+    teacher_path = ("teacher_resnet18_mnist.pt" if args.val_split == 0
+                    else f"teacher_resnet18_mnist_val{args.val_split}_seed{args.seed}.pt")
+    teacher = train_teacher_if_needed(device, train_loader, test_loader, rank, path=teacher_path)
+
     # === 2. Setup Student (ONN) ===
     student = OpticalNetwork(
         input_channels=args.input_channels, hidden_channels=args.hidden_channels,
@@ -462,12 +491,12 @@ def main():
         fc_mzi_column_num=args.fc_mzi_column_num,
         fc_mzi_repeat_num=args.fc_mzi_repeat_num,
     ).to(device)
-    
+
     load_mzi_calibration(student, 'results/mzi_parameters_multi.json')
 
     # === 3. Feature Adapter ===
     feature_adapter = nn.Linear(student.feature_size, 512).to(device)
-    
+
     if is_distributed:
         student = DDP(student, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
         feature_adapter = DDP(feature_adapter, device_ids=[local_rank], output_device=local_rank)
@@ -530,7 +559,11 @@ def main():
             print(f"[Optimizer] per-processor power budget: {POWER_BUDGET_MW:.1f} mW")
     scaler = GradScaler()
     best_test_accuracy = 0.0
-    
+    best_val_accuracy = -1.0
+    test_acc_at_best_val = float('nan')
+    best_val_epoch = 0
+    last_test_acc = float('nan')
+
     KD_BETA = float(os.environ.get('DISTILL_BETA', 1.0))
 
     if rank == 0:
@@ -542,29 +575,51 @@ def main():
     # === Training Loop ===
     for epoch in range(1, args.epochs + 1):
         if is_distributed: train_sampler.set_epoch(epoch)
-        
+
         # Annealing Input Noise (unchanged)
         if epoch <= 5: curr_sigma = 0.0
         elif epoch <= 15: curr_sigma = args.input_noise_sigma * ((epoch - 5) / 10.0)
         else: curr_sigma = args.input_noise_sigma
-        
+
         if rank == 0:
             print(f"\n>>> Epoch {epoch} | Distilling with Input Noise: {curr_sigma:.4f}")
 
         # Train (now with weight noise support)
         train_distill(student, teacher, device, train_loader, optimizer, epoch, scaler, args,
                       test_noise_transform, curr_sigma, feature_adapter, scheduler, rank)
-        
-        # Test (now with weight noise support)
-        test_loss, test_acc = test_ensemble(student, device, test_loader, args, rank, num_repeats=5)
 
-        if rank == 0 and test_acc > best_test_accuracy:
+        # Test (now with weight noise support)
+        test_loss, test_acc = test_ensemble(student, device, test_loader, args, rank, num_repeats=5, name="Test")
+        last_test_acc = test_acc
+
+        if val_loader is not None:
+            # Validation-based model selection: the test set is reported but never
+            # used to choose the checkpoint.
+            val_loss, val_acc = test_ensemble(student, device, val_loader, args, rank, num_repeats=5, name="Validation")
+            if rank == 0:
+                print(f"[Epoch {epoch}] val_acc={val_acc:.2f}%  test_acc={test_acc:.2f}%")
+            if rank == 0 and val_acc > best_val_accuracy:
+                best_val_accuracy = val_acc
+                test_acc_at_best_val = test_acc
+                best_val_epoch = epoch
+                model_to_save = student.module if is_distributed else student
+                suffix = os.environ.get('SAVE_SUFFIX', '')
+                save_name = f"distilled_shared_K{args.num_shared_weights}_ch{args.hidden_channels}{suffix}_best.pt"
+                torch.save(model_to_save.state_dict(), save_name)
+                print(f"[Best Student Updated] Val Acc: {val_acc:.2f}% | Test Acc at this epoch: {test_acc:.2f}% (Saved to {save_name})")
+        elif rank == 0 and test_acc > best_test_accuracy:
             best_test_accuracy = test_acc
             model_to_save = student.module if is_distributed else student
             suffix = os.environ.get('SAVE_SUFFIX', '')
             save_name = f"distilled_shared_K{args.num_shared_weights}_ch{args.hidden_channels}{suffix}_best.pt"
             torch.save(model_to_save.state_dict(), save_name)
             print(f"[Best Student Updated] Acc: {test_acc:.2f}% (Saved to {save_name})")
+
+    if rank == 0 and val_loader is not None:
+        print(f"[Final] K={args.num_shared_weights} val_split={args.val_split} "
+              f"best_val_acc={best_val_accuracy:.2f}% at epoch {best_val_epoch} | "
+              f"test_acc_at_best_val={test_acc_at_best_val:.2f}% | "
+              f"last_epoch_test_acc={last_test_acc:.2f}%")
 
     if is_distributed: dist.destroy_process_group()
 

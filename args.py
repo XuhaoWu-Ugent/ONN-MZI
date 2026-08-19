@@ -95,6 +95,11 @@ def get_args():
                             help='Testing batch size')
     train_group.add_argument('--epochs', type=int, default=7,
                             help='Number of training epochs')
+    train_group.add_argument('--val-split', type=int, default=0,
+                            help='Hold out this many MNIST training images as a validation set '
+                                 '(fixed split, seeded by --seed). When > 0, model selection '
+                                 '(best checkpoint) uses validation accuracy and the test set is '
+                                 'only reported. 0 = legacy behaviour (select on test set).')
     train_group.add_argument('--lr', type=float, default=0.01,
                             help='Learning rate')
     train_group.add_argument('--grad-clip', type=float, default=10.0,
